@@ -5,9 +5,6 @@ import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import multer from "multer";
 import { createClient } from "@supabase/supabase-js";
-import { db } from "./src/db";
-import { examPapers, transactions, contactMessages, affiliatePartners } from "./src/db/schema";
-import { eq, desc } from "drizzle-orm";
 
 dotenv.config();
 
@@ -21,13 +18,18 @@ const upload = multer({
 });
 
 // Initialize Supabase Server Admin Client
-const rawSupabaseUrl = process.env.VITE_SUPABASE_URL || 'https://cwspikvwjsg2imxbuo5e.supabase.co';
+const rawSupabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
+if (!rawSupabaseUrl) {
+  console.error("FATAL: VITE_SUPABASE_URL or SUPABASE_URL is required for the production server.");
+  process.exit(1);
+}
 const supabaseUrl = rawSupabaseUrl.replace(/\/rest\/v1\/?$/, '').replace(/\/$/, '');
-const supabaseServiceKey =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_SECRET_KEY ||
-  process.env.VITE_SUPABASE_ANON_KEY ||
-  '';
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseServiceKey) {
+  console.error("FATAL: SUPABASE_SERVICE_ROLE_KEY is required for the production server. NEVER use the anon key on the server.");
+  process.exit(1);
+}
 
 const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
   auth: {
@@ -35,12 +37,6 @@ const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
     autoRefreshToken: false,
   },
 });
-
-if (!process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_SECRET_KEY) {
-  console.warn(
-    "Notice: SUPABASE_SERVICE_ROLE_KEY environment variable is not defined on server. Please add SUPABASE_SERVICE_ROLE_KEY to .env for server-side Storage administration."
-  );
-}
 
 // Increase body limit for base64 image uploads
 app.use(express.json({ limit: '50mb' }));
@@ -94,19 +90,7 @@ app.post("/api/digitize-paper", async (req, res) => {
   }
 });
 
-// Seed and fallback data store for exam papers (starts empty, real source of truth is Supabase public.papers)
-const inMemoryPapers: any[] = [];
-
-// Transactions store (starts empty, payment backend not yet connected)
-const inMemoryTransactions: any[] = [];
-
-// Messages store (starts empty, contact messaging backend not yet connected)
-const inMemoryMessages: any[] = [];
-
-// Affiliate partners store (starts empty, affiliate backend not yet connected)
-const inMemoryAffiliates: any[] = [];
-
-// Database API Routes with Safe In-Memory Fallback
+// Database API Routes
 
 /**
  * Secure Backend Endpoint for Paper Upload & Administration
@@ -234,13 +218,6 @@ app.post("/api/papers/upload", upload.single("pdfFile"), async (req, res) => {
         fileSize: `${(file!.size / (1024 * 1024)).toFixed(1)} MB`,
       };
 
-      const idx = inMemoryPapers.findIndex(p => p.id === safePaper.id);
-      if (idx !== -1) {
-        inMemoryPapers[idx] = safePaper;
-      } else {
-        inMemoryPapers.unshift(safePaper);
-      }
-
       return res.status(201).json({ success: true, paper: safePaper });
     } else {
       // --- EDIT EXISTING PAPER ---
@@ -311,9 +288,6 @@ app.post("/api/papers/upload", upload.single("pdfFile"), async (req, res) => {
           fileSize: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
         };
 
-        const idx = inMemoryPapers.findIndex(p => p.id === paperId);
-        if (idx !== -1) inMemoryPapers[idx] = safePaper;
-
         return res.json({ success: true, paper: safePaper });
       } else {
         // --- EDIT METADATA ONLY ---
@@ -346,9 +320,6 @@ app.post("/api/papers/upload", upload.single("pdfFile"), async (req, res) => {
           fileName: updatedData.file_path,
         };
 
-        const idx = inMemoryPapers.findIndex(p => p.id === paperId);
-        if (idx !== -1) inMemoryPapers[idx] = safePaper;
-
         return res.json({ success: true, paper: safePaper });
       }
     }
@@ -359,228 +330,58 @@ app.post("/api/papers/upload", upload.single("pdfFile"), async (req, res) => {
 });
 
 app.get("/api/papers", async (req, res) => {
-  if (db) {
-    try {
-      const papers = await db.select().from(examPapers).orderBy(desc(examPapers.createdAt));
-      if (papers && papers.length > 0) {
-        const normalized = papers.map((p) => ({
-          id: p.id,
-          unit_code: p.unitCode,
-          paper_title: p.unitName,
-          unitCode: p.unitCode,
-          unitName: p.unitName,
-          price: p.price,
-          status: p.isAvailable ? 'available' : 'unavailable',
-          isAvailable: p.isAvailable,
-          file_path: p.fileName || `papers/${p.unitCode}_Exam.pdf`,
-          fileName: p.fileName,
-          fileSize: p.fileSize || '1.2 MB',
-          year: p.year,
-          downloadsCount: p.downloadsCount,
-          docId: p.docId,
-          digitizedContent: p.digitizedContent,
-          created_at: p.createdAt ? new Date(p.createdAt).toISOString() : new Date().toISOString(),
-          createdAt: p.createdAt ? new Date(p.createdAt).toISOString() : new Date().toISOString(),
-        }));
-        return res.json(normalized);
-      }
-    } catch (err: any) {
-      console.warn("Database query skipped/failed, using in-memory store:", err?.message || err);
-    }
-  }
-  res.json(inMemoryPapers);
-});
+  try {
+    const { data: papers, error } = await supabaseAdmin
+      .from("Papers")
+      .select("*")
+      .order("created_at", { ascending: false });
 
-app.post("/api/papers", async (req, res) => {
-  const paperData = req.body;
-  const unitCode = (paperData.unit_code || paperData.unitCode || 'UNIT101').trim().toUpperCase();
-  const unitName = (paperData.paper_title || paperData.unitName || 'Course Unit').trim();
-  const price = paperData.price || 'KSh 50';
-  const status = paperData.status || (paperData.isAvailable !== false ? 'available' : 'unavailable');
-  const isAvailable = status === 'available';
-  const filePath = paperData.file_path || paperData.fileName || `papers/${unitCode}_Exam.pdf`;
-  const year = paperData.year || '2024';
-
-  if (db) {
-    try {
-      const newPaper = await db.insert(examPapers).values({
-        unitName,
-        unitCode,
-        year,
-        price,
-        isAvailable,
-        downloadsCount: paperData.downloadsCount || 0,
-        docId: paperData.docId || `MKU-${unitCode}-${year}-${Math.floor(100 + Math.random() * 900)}`,
-        fileName: filePath,
-        fileSize: paperData.fileSize || '1.2 MB',
-        digitizedContent: paperData.digitizedContent || null,
-      }).returning();
-
-      if (newPaper && newPaper[0]) {
-        const formatted = {
-          id: newPaper[0].id,
-          unit_code: newPaper[0].unitCode,
-          paper_title: newPaper[0].unitName,
-          unitCode: newPaper[0].unitCode,
-          unitName: newPaper[0].unitName,
-          price: newPaper[0].price,
-          status: newPaper[0].isAvailable ? 'available' : 'unavailable',
-          isAvailable: newPaper[0].isAvailable,
-          file_path: newPaper[0].fileName,
-          fileName: newPaper[0].fileName,
-          fileSize: newPaper[0].fileSize,
-          year: newPaper[0].year,
-          downloadsCount: newPaper[0].downloadsCount,
-          docId: newPaper[0].docId,
-          digitizedContent: newPaper[0].digitizedContent,
-          created_at: new Date(newPaper[0].createdAt).toISOString(),
-          createdAt: new Date(newPaper[0].createdAt).toISOString(),
-        };
-        inMemoryPapers.unshift(formatted);
-        return res.json(formatted);
-      }
-    } catch (err: any) {
-      console.warn("Database insert skipped/failed, using in-memory store:", err?.message || err);
-    }
-  }
-
-  const fallbackPaper = {
-    id: `paper-${Date.now()}-${Math.random().toString(36).substring(7)}`,
-    unit_code: unitCode,
-    paper_title: unitName,
-    unitCode: unitCode,
-    unitName: unitName,
-    year,
-    price,
-    status,
-    isAvailable,
-    downloadsCount: paperData.downloadsCount || 0,
-    docId: paperData.docId || `MKU-${unitCode}-${year}-${Math.floor(100 + Math.random() * 900)}`,
-    file_path: filePath,
-    fileName: filePath,
-    fileSize: paperData.fileSize || '1.2 MB',
-    digitizedContent: paperData.digitizedContent || null,
-    created_at: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
-  };
-  inMemoryPapers.unshift(fallbackPaper);
-  res.json(fallbackPaper);
-});
-
-// Update Paper
-app.patch("/api/papers/:id", async (req, res) => {
-  const { id } = req.params;
-  const updates = req.body;
-
-  const index = inMemoryPapers.findIndex(p => p.id === id || p.docId === id);
-  if (index !== -1) {
-    const existing = inMemoryPapers[index];
-    const unitCode = updates.unit_code || updates.unitCode || existing.unit_code;
-    const paperTitle = updates.paper_title || updates.unitName || existing.paper_title;
-    const price = updates.price !== undefined ? updates.price : existing.price;
-    const status = updates.status !== undefined ? updates.status : (updates.isAvailable !== undefined ? (updates.isAvailable ? 'available' : 'unavailable') : existing.status);
-    const filePath = updates.file_path || updates.fileName || existing.file_path;
-
-    const updated = {
-      ...existing,
-      unit_code: unitCode,
-      paper_title: paperTitle,
-      unitCode,
-      unitName: paperTitle,
-      price,
-      status,
-      isAvailable: status === 'available',
-      file_path: filePath,
-      fileName: filePath,
-      ...(updates.year ? { year: updates.year } : {}),
-    };
-    inMemoryPapers[index] = updated;
-
-    if (db) {
-      try {
-        await db.update(examPapers).set({
-          unitName: paperTitle,
-          unitCode,
-          price,
-          isAvailable: status === 'available',
-          fileName: filePath,
-          ...(updates.year ? { year: updates.year } : {}),
-        }).where(eq(examPapers.id, id));
-      } catch (e) {
-        console.warn("DB update skipped:", e);
-      }
+    if (error) {
+      console.error("Database query failed:", error);
+      return res.status(500).json({ error: "Failed to fetch papers" });
     }
 
-    return res.json(updated);
+    if (papers) {
+      const normalized = papers.map((p) => ({
+        id: p.id,
+        unit_code: p.unit_code,
+        paper_title: p.paper_title,
+        unitCode: p.unit_code,
+        unitName: p.paper_title,
+        price: p.price,
+        status: p.status,
+        isAvailable: p.status === 'available',
+        file_path: p.file_path,
+        fileName: p.file_path,
+        created_at: p.created_at,
+        createdAt: p.created_at,
+      }));
+      return res.json(normalized);
+    }
+    return res.json([]);
+  } catch (err: any) {
+    console.error("Database query failed:", err?.message || err);
+    return res.status(500).json({ error: "Failed to fetch papers" });
   }
-
-  res.status(404).json({ error: "Paper not found" });
 });
 
-app.put("/api/papers/:id", async (req, res) => {
-  const { id } = req.params;
-  const updates = req.body;
-  const index = inMemoryPapers.findIndex(p => p.id === id || p.docId === id);
-  if (index !== -1) {
-    const existing = inMemoryPapers[index];
-    const unitCode = (updates.unit_code || updates.unitCode || existing.unit_code).toUpperCase();
-    const paperTitle = updates.paper_title || updates.unitName || existing.paper_title;
-    const price = updates.price || existing.price;
-    const status = updates.status || (updates.isAvailable !== undefined ? (updates.isAvailable ? 'available' : 'unavailable') : existing.status);
-    const filePath = updates.file_path || updates.fileName || existing.file_path;
-
-    const updated = {
-      ...existing,
-      unit_code: unitCode,
-      paper_title: paperTitle,
-      unitCode,
-      unitName: paperTitle,
-      price,
-      status,
-      isAvailable: status === 'available',
-      file_path: filePath,
-      fileName: filePath,
-    };
-    inMemoryPapers[index] = updated;
-    return res.json(updated);
-  }
-  res.status(404).json({ error: "Paper not found" });
-});
-
-// Delete Paper
 app.delete("/api/papers/:id", async (req, res) => {
   const { id } = req.params;
-  const index = inMemoryPapers.findIndex(p => p.id === id || p.docId === id);
-  if (index !== -1) {
-    inMemoryPapers.splice(index, 1);
-  }
-  if (db) {
-    try {
-      await db.delete(examPapers).where(eq(examPapers.id, id));
-    } catch (e) {
-      console.warn("DB delete skipped:", e);
+  try {
+    const { data: paper } = await supabaseAdmin.from("Papers").select("file_path").eq("id", id).single();
+    await supabaseAdmin.from("Papers").delete().eq("id", id);
+    if (paper?.file_path) {
+      await supabaseAdmin.storage.from("Papers").remove([paper.file_path]).catch(e => console.warn("Notice: Old storage cleanup skipped", e));
     }
+    res.json({ success: true });
+  } catch (e) {
+    console.error("DB delete failed:", e);
+    res.status(500).json({ error: "Failed to delete paper" });
   }
-  res.json({ success: true });
 });
 
 app.post("/api/papers/:id/download", async (req, res) => {
-  const { id } = req.params;
-  const paperInMemory = inMemoryPapers.find(p => p.id === id || p.docId === id);
-  if (paperInMemory) {
-    paperInMemory.downloadsCount = (paperInMemory.downloadsCount || 0) + 1;
-  }
-  if (db) {
-    try {
-      const paper = await db.select().from(examPapers).where(eq(examPapers.id, id)).limit(1);
-      if (paper.length > 0) {
-        await db.update(examPapers).set({ downloadsCount: paper[0].downloadsCount + 1 }).where(eq(examPapers.id, id));
-      }
-    } catch (err: any) {
-      console.warn("Database update skipped/failed:", err?.message || err);
-    }
-  }
-  res.json({ success: true });
+  res.status(403).json({ error: "Downloads must be processed through the secure order entitlement flow." });
 });
 
 // Helper function to normalize Kenyan phone numbers to 254XXXXXXXXX format
@@ -1014,249 +815,203 @@ app.post("/api/mpesa/callback", async (req, res) => {
   }
 });
 
-app.get("/api/transactions", async (req, res) => {
-  if (db) {
-    try {
-      const tx = await db.select().from(transactions).orderBy(desc(transactions.timestamp));
-      if (tx && tx.length > 0) {
-        return res.json(tx);
-      }
-    } catch (err: any) {
-      console.warn("Database query skipped/failed, using in-memory store:", err?.message || err);
+// Real Order Status Checking Endpoint for Polling Client
+app.get("/api/orders/:orderId/status", async (req, res) => {
+  const { orderId } = req.params;
+  try {
+    const { data: order, error: orderErr } = await supabaseAdmin
+      .from("Orders")
+      .select("id, status, amount, customer_id, paper_id")
+      .eq("id", orderId)
+      .maybeSingle();
+
+    if (orderErr || !order) {
+      return res.status(404).json({ success: false, error: "Order not found" });
     }
+
+    const { data: payment } = await supabaseAdmin
+      .from("payments")
+      .select("id, status, mpesa_receipt, amount, phone")
+      .eq("order_id", orderId)
+      .maybeSingle();
+
+    return res.json({
+      success: true,
+      orderId: order.id,
+      orderStatus: order.status,
+      paymentStatus: payment?.status || 'pending',
+      isPaid: order.status === 'paid',
+      mpesaReceipt: payment?.mpesa_receipt || null,
+    });
+  } catch (err: any) {
+    console.error("Error checking order status:", err);
+    return res.status(500).json({ success: false, error: "Internal server error" });
   }
-  res.json(inMemoryTransactions);
+});
+
+// Secure Authorized Download Endpoint for Confirmed Paid Orders
+app.get("/api/orders/:orderId/download", async (req, res) => {
+  const { orderId } = req.params;
+  try {
+    const { data: order, error: orderErr } = await supabaseAdmin
+      .from("Orders")
+      .select("id, status, paper_id")
+      .eq("id", orderId)
+      .maybeSingle();
+
+    if (orderErr || !order) {
+      return res.status(404).json({ success: false, error: "Order not found" });
+    }
+
+    if (order.status !== 'paid') {
+      return res.status(403).json({ success: false, error: "Payment not verified. Access denied." });
+    }
+
+    const { data: paper, error: paperErr } = await supabaseAdmin
+      .from("Papers")
+      .select("id, file_path, paper_title, unit_code")
+      .eq("id", order.paper_id)
+      .maybeSingle();
+
+    if (paperErr || !paper || !paper.file_path) {
+      return res.status(404).json({ success: false, error: "Paper file not found in repository." });
+    }
+
+    try {
+      await supabaseAdmin
+        .from("downloads")
+        .upsert({
+          order_id: order.id,
+          paper_id: order.paper_id,
+          downloaded_at: new Date().toISOString()
+        }, { onConflict: 'order_id' });
+    } catch (dlErr) {
+      console.warn("Notice: downloads record creation skipped/logged:", dlErr);
+    }
+
+    const { data: signedData, error: signErr } = await supabaseAdmin
+      .storage
+      .from("Papers")
+      .createSignedUrl(paper.file_path, 60);
+
+    if (signErr || !signedData?.signedUrl) {
+      console.error("Error generating signed download URL:", signErr);
+      return res.status(500).json({ success: false, error: "Failed to generate secure download link." });
+    }
+
+    return res.json({
+      success: true,
+      downloadUrl: signedData.signedUrl,
+      paper_title: paper.paper_title,
+      unit_code: paper.unit_code
+    });
+  } catch (err: any) {
+    console.error("Error generating order download:", err);
+    return res.status(500).json({ success: false, error: "Internal server error" });
+  }
+});
+
+app.get("/api/transactions", async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('payments')
+      .select(`
+        id, mpesa_receipt, phone, amount, status, created_at,
+        Orders (
+          id,
+          customers (first_name, second_name, phone),
+          Papers (unit_code, paper_title)
+        )
+      `)
+      .order('created_at', { ascending: false });
+    
+    if (error) throw error;
+    
+    const formatted = data.map((p: any) => ({
+      id: p.id,
+      studentFirstName: p.Orders?.customers?.first_name || '',
+      studentSecondName: p.Orders?.customers?.second_name || '',
+      phone: p.phone,
+      unitCode: p.Orders?.Papers?.unit_code || '',
+      unitName: p.Orders?.Papers?.paper_title || '',
+      price: `KSh ${p.amount}`,
+      mpesaReceipt: p.mpesa_receipt || 'PENDING',
+      status: p.status === 'completed' ? 'Completed' : (p.status === 'pending' ? 'Pending' : 'Failed'),
+      timestamp: p.created_at
+    }));
+    return res.json(formatted);
+  } catch (err) {
+    console.error("Transactions fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch transactions" });
+  }
 });
 
 app.post("/api/transactions", async (req, res) => {
-  const txData = req.body;
-  if (db) {
-    try {
-      const newTx = await db.insert(transactions).values(txData).returning();
-      if (newTx && newTx[0]) {
-        inMemoryTransactions.unshift(newTx[0] as any);
-        return res.json(newTx[0]);
-      }
-    } catch (err: any) {
-      console.warn("Database insert skipped/failed, using in-memory store:", err?.message || err);
-    }
-  }
-
-  const fallbackTx = {
-    id: `TX-${Math.floor(1000 + Math.random() * 9000)}`,
-    studentFirstName: txData.studentFirstName || 'Student',
-    studentSecondName: txData.studentSecondName || '',
-    phone: txData.phone || '',
-    unitCode: txData.unitCode || txData.unit_code || '',
-    unitName: txData.unitName || txData.paper_title || '',
-    unit_code: txData.unitCode || txData.unit_code || '',
-    paper_title: txData.unitName || txData.paper_title || '',
-    price: txData.price || 'KSh 50',
-    mpesaReceipt: txData.mpesaReceipt || `QK${Math.floor(100000 + Math.random() * 900000)}`,
-    passwordUsed: txData.passwordUsed || txData.studentFirstName || 'Paper',
-    status: txData.status || 'Completed',
-    timestamp: new Date().toISOString(),
-  };
-  inMemoryTransactions.unshift(fallbackTx);
-  res.json(fallbackTx);
+  res.status(403).json({ error: "Forbidden. Use secure M-Pesa STK push flow." });
 });
 
 app.delete("/api/transactions/:id", async (req, res) => {
-  const { id } = req.params;
-  const index = inMemoryTransactions.findIndex(t => t.id === id || t.mpesaReceipt === id);
-  if (index !== -1) {
-    inMemoryTransactions.splice(index, 1);
-  }
-  res.json({ success: true });
+  res.status(403).json({ error: "Forbidden. Cannot delete transaction records." });
 });
 
 app.get("/api/messages", async (req, res) => {
-  if (db) {
-    try {
-      const msgs = await db.select().from(contactMessages).orderBy(desc(contactMessages.timestamp));
-      if (msgs && msgs.length > 0) {
-        return res.json(msgs);
-      }
-    } catch (err: any) {
-      console.warn("Database query skipped/failed, using in-memory store:", err?.message || err);
-    }
-  }
-  res.json(inMemoryMessages);
+  res.json([]);
 });
 
 app.post("/api/messages", async (req, res) => {
-  const msgData = req.body;
-  if (db) {
-    try {
-      const newMsg = await db.insert(contactMessages).values(msgData).returning();
-      if (newMsg && newMsg[0]) {
-        inMemoryMessages.unshift(newMsg[0] as any);
-        return res.json(newMsg[0]);
-      }
-    } catch (err: any) {
-      console.warn("Database insert skipped/failed, using in-memory store:", err?.message || err);
-    }
-  }
-
-  const fallbackMsg = {
-    id: `MSG-${Math.floor(100 + Math.random() * 900)}`,
-    fullName: msgData.fullName || 'Anonymous',
-    email: msgData.email || '',
-    phone: msgData.phone || '',
-    subject: msgData.subject || 'Inquiry',
-    message: msgData.message || '',
-    timestamp: new Date().toISOString(),
-    isRead: false,
-  };
-  inMemoryMessages.unshift(fallbackMsg);
-  res.json(fallbackMsg);
+  res.status(501).json({ error: "Messages not yet implemented in Supabase" });
 });
 
 app.patch("/api/messages/:id", async (req, res) => {
-  const { id } = req.params;
-  const { isRead } = req.body;
-  const msg = inMemoryMessages.find(m => m.id === id);
-  if (msg) {
-    if (isRead !== undefined) msg.isRead = isRead;
-    return res.json(msg);
-  }
-  res.status(404).json({ error: "Message not found" });
+  res.status(501).json({ error: "Messages not yet implemented in Supabase" });
 });
 
 app.delete("/api/messages/:id", async (req, res) => {
-  const { id } = req.params;
-  const idx = inMemoryMessages.findIndex(m => m.id === id);
-  if (idx !== -1) {
-    inMemoryMessages.splice(idx, 1);
-  }
-  res.json({ success: true });
+  res.status(501).json({ error: "Messages not yet implemented in Supabase" });
 });
 
 // Admin Live Stats Endpoint
-app.get("/api/admin/stats", (req, res) => {
-  const totalPapers = inMemoryPapers.length;
-  const activePapers = inMemoryPapers.filter(p => p.status === 'available' || p.isAvailable).length;
-  const totalDownloads = inMemoryPapers.reduce((sum, p) => sum + (Number(p.downloadsCount) || 0), 0);
-  const totalRevenue = inMemoryTransactions
-    .filter(t => t.status === 'Completed')
-    .reduce((sum, t) => {
-      const num = parseInt(String(t.price).replace(/[^0-9]/g, ''), 10) || 50;
-      return sum + num;
-    }, 0);
-  const transactionCount = inMemoryTransactions.length;
-  const pendingAffiliates = inMemoryAffiliates.filter(a => a.status === 'Pending Review').length;
-  const unreadMessages = inMemoryMessages.filter(m => !m.isRead).length;
+app.get("/api/admin/stats", async (req, res) => {
+  try {
+    const [{ count: totalPapers }, { count: activePapers }, { count: totalDownloads }, { data: payments }] = await Promise.all([
+      supabaseAdmin.from('Papers').select('*', { count: 'exact', head: true }),
+      supabaseAdmin.from('Papers').select('*', { count: 'exact', head: true }).eq('status', 'available'),
+      supabaseAdmin.from('downloads').select('*', { count: 'exact', head: true }),
+      supabaseAdmin.from('payments').select('amount').eq('status', 'completed')
+    ]);
 
-  res.json({
-    totalPapers,
-    activePapers,
-    totalDownloads,
-    totalRevenue: `KSh ${totalRevenue.toLocaleString()}`,
-    transactionCount,
-    pendingAffiliates,
-    unreadMessages,
-  });
+    const totalRevenue = payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
+    
+    res.json({
+      totalPapers: totalPapers || 0,
+      activePapers: activePapers || 0,
+      totalDownloads: totalDownloads || 0,
+      totalRevenue: `KSh ${totalRevenue.toLocaleString()}`,
+      transactionCount: payments?.length || 0,
+      pendingAffiliates: 0,
+      unreadMessages: 0,
+    });
+  } catch (err) {
+    console.error("Stats fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch stats" });
+  }
 });
 
 // Affiliate Program Endpoints
 app.get("/api/affiliates", async (req, res) => {
-  if (db) {
-    try {
-      const affiliates = await db.select().from(affiliatePartners).orderBy(desc(affiliatePartners.createdAt));
-      if (affiliates && affiliates.length > 0) {
-        return res.json(affiliates);
-      }
-    } catch (err: any) {
-      console.warn("Database query skipped/failed, using in-memory store:", err?.message || err);
-    }
-  }
-  res.json(inMemoryAffiliates);
+  res.json([]);
 });
 
 app.post("/api/affiliates", async (req, res) => {
-  const {
-    fullName,
-    phone,
-    email,
-    linkedInUrl,
-    university,
-    campusCourse,
-    unitsDescription,
-    paperCount,
-    academicYears,
-    referralCode,
-  } = req.body;
-
-  const finalCode =
-    referralCode ||
-    `APP-${(fullName || 'AFF').trim().toUpperCase().replace(/[^A-Z]/g, '').slice(0, 5)}${Math.floor(10 + Math.random() * 89)}`;
-
-  const partnerData = {
-    fullName: fullName || 'Anonymous Supplier',
-    phone: phone || '',
-    email: email || `${finalCode.toLowerCase()}@seller.exampapers.co.ke`,
-    university: university || 'Mount Kenya University (MKU)',
-    campusCourse: campusCourse || 'General Course',
-    referralCode: finalCode,
-    commissionRate: 'Direct Paper Purchase',
-    totalEarnings: 'Pending Review',
-    totalReferrals: typeof paperCount === 'string' ? parseInt(paperCount, 10) || 1 : 1,
-    status: 'Pending Review',
-  };
-
-  if (db) {
-    try {
-      const newPartner = await db.insert(affiliatePartners).values(partnerData).returning();
-      if (newPartner && newPartner[0]) {
-        const enriched = {
-          ...newPartner[0],
-          linkedInUrl: linkedInUrl || '',
-          unitsDescription: unitsDescription || '',
-          paperCount: paperCount || '',
-          academicYears: academicYears || '',
-        };
-        inMemoryAffiliates.unshift(enriched as any);
-        return res.json(enriched);
-      }
-    } catch (err: any) {
-      console.warn("Database insert skipped/failed, using in-memory store:", err?.message || err);
-    }
-  }
-
-  const fallbackPartner = {
-    id: `AFF-${Math.floor(100 + Math.random() * 900)}`,
-    ...partnerData,
-    linkedInUrl: linkedInUrl || '',
-    unitsDescription: unitsDescription || '',
-    paperCount: paperCount || '',
-    academicYears: academicYears || '',
-    createdAt: new Date().toISOString(),
-  };
-  inMemoryAffiliates.unshift(fallbackPartner);
-  res.json(fallbackPartner);
+  res.status(501).json({ error: "Affiliates not yet implemented in Supabase" });
 });
 
 app.patch("/api/affiliates/:id", async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
-
-  const target = inMemoryAffiliates.find((a) => a.id === id || a.referralCode === id);
-  if (target) {
-    if (status) target.status = status;
-    return res.json(target);
-  }
-
-  res.status(404).json({ error: "Affiliate not found" });
+  res.status(501).json({ error: "Affiliates not yet implemented in Supabase" });
 });
 
 app.delete("/api/affiliates/:id", async (req, res) => {
-  const { id } = req.params;
-  const index = inMemoryAffiliates.findIndex((a) => a.id === id || a.referralCode === id);
-  if (index !== -1) {
-    inMemoryAffiliates.splice(index, 1);
-    return res.json({ success: true });
-  }
-  res.json({ success: true });
+  res.status(501).json({ error: "Affiliates not yet implemented in Supabase" });
 });
 
 async function startServer() {

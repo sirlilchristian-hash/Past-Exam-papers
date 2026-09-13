@@ -201,6 +201,10 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
   const [secondName, setSecondName] = useState<string>('');
   const [phone, setPhone] = useState<string>('');
   const [paymentErrors, setPaymentErrors] = useState<Record<string, string>>({});
+  const [currentOrderId, setCurrentOrderId] = useState<string | null>(null);
+  const [mpesaReceipt, setMpesaReceipt] = useState<string>('');
+  const [isInitiatingPayment, setIsInitiatingPayment] = useState<boolean>(false);
+  const [paymentStatusMessage, setPaymentStatusMessage] = useState<string>('');
 
   // In-App Password Unlock Modal State
   const [showUnlockModal, setShowUnlockModal] = useState<boolean>(false);
@@ -417,8 +421,8 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
     setStep(3);
   };
 
-  // Handle Initiate M-Pesa Payment (Step 3 -> Step 4)
-  const handlePaySubmit = (e: React.FormEvent) => {
+  // Handle Initiate Real M-Pesa STK Push (Step 3 -> Step 4)
+  const handlePaySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const errors: Record<string, string> = {};
 
@@ -435,42 +439,78 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
       return;
     }
 
+    if (!selectedPaper) return;
+
     setPaymentErrors({});
-    setStep(4); // Move to Waiting for M-Pesa Prompt
+    setIsInitiatingPayment(true);
+
+    try {
+      const res = await fetch('/api/mpesa/stkpush', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          paper_id: selectedPaper.id,
+          first_name: firstName.trim(),
+          second_name: secondName.trim(),
+          phone: phone.trim(),
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setPaymentErrors({ phone: data.error || 'Failed to initiate M-Pesa STK push.' });
+        setIsInitiatingPayment(false);
+        return;
+      }
+
+      setCurrentOrderId(data.orderId);
+      setIsInitiatingPayment(false);
+      setPaymentStatusMessage(data.customerMessage || 'Please complete the M-Pesa prompt on your phone.');
+      setStep(4);
+    } catch (err: any) {
+      setPaymentErrors({ phone: err.message || 'Network error initiating payment. Please try again.' });
+      setIsInitiatingPayment(false);
+    }
   };
 
-  // Step 4 Simulation Timer: Auto transition to Step 5 after 3.5s
+  // Step 4 Real Payment Verification: Poll backend /api/orders/:orderId/status
   useEffect(() => {
-    let timer: NodeJS.Timeout;
-    if (step === 4) {
-      timer = setTimeout(async () => {
-        // Record transaction in DB before transitioning
-        if (selectedPaper) {
-           try {
-             await fetch('/api/transactions', {
-               method: 'POST',
-               headers: { 'Content-Type': 'application/json' },
-               body: JSON.stringify({
-                 studentFirstName: firstName,
-                 studentSecondName: secondName,
-                 phone: phone,
-                 unit_code: selectedPaper.unit_code,
-                 paper_title: selectedPaper.paper_title,
-                 price: selectedPaper.price,
-                 mpesaReceipt: `QK${Math.floor(10 + Math.random() * 89)}${Math.random().toString(36).substring(2,6).toUpperCase()}`,
-                 passwordUsed: firstName,
-                 status: 'Completed'
-               })
-             });
-           } catch (err) {
-             console.error("Failed to record transaction", err);
-           }
+    if (step !== 4 || !currentOrderId) return;
+
+    let attempts = 0;
+    const maxAttempts = 30; // 30 * 2.5s = 75 seconds timeout
+    const interval = setInterval(async () => {
+      attempts++;
+      try {
+        const res = await fetch(`/api/orders/${currentOrderId}/status`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.isPaid || data.orderStatus === 'paid') {
+            clearInterval(interval);
+            if (data.mpesaReceipt) {
+              setMpesaReceipt(data.mpesaReceipt);
+            }
+            setStep(5);
+            return;
+          }
+          if (data.paymentStatus === 'failed' || data.orderStatus === 'failed') {
+            clearInterval(interval);
+            setPaymentStatusMessage('Payment declined or failed. Please return to previous step and try again.');
+            return;
+          }
         }
-        setStep(5); // Payment Confirmed!
-      }, 3500);
-    }
-    return () => clearTimeout(timer);
-  }, [step, selectedPaper, firstName, secondName, phone]);
+      } catch (err) {
+        console.error("Status poll error:", err);
+      }
+
+      if (attempts >= maxAttempts) {
+        clearInterval(interval);
+        setPaymentStatusMessage('Payment confirmation timed out. If you already entered your PIN, please refresh the page.');
+      }
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [step, currentOrderId]);
 
   // Handle Trigger Real Encrypted PDF File Download (Protected & Uneditable Format)
   const handleDownloadPaper = async () => {
@@ -685,17 +725,21 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
       document.body.removeChild(link);
       URL.revokeObjectURL(downloadUrl);
       
-      try {
-        await fetch(`/api/papers/${selectedPaper.id}/download`, { method: 'POST' });
-      } catch(e) {
-        console.error("Failed to increment download count:", e);
+      if (currentOrderId) {
+        try {
+          await fetch(`/api/orders/${currentOrderId}/download`);
+        } catch(e) {
+          console.error("Failed to record order download:", e);
+        }
       }
     } catch (err) {
       console.error('PDF Encryption fallback:', err);
       doc.save(downloadFileName);
-      try {
-        await fetch(`/api/papers/${selectedPaper.id}/download`, { method: 'POST' });
-      } catch(e) {}
+      if (currentOrderId) {
+        try {
+          await fetch(`/api/orders/${currentOrderId}/download`);
+        } catch(e) {}
+      }
     }
 
     setHasDownloaded(true);
@@ -1244,10 +1288,11 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
 
               <button
                 type="submit"
-                className="w-full py-3.5 bg-[#00D26A] hover:bg-[#00b85c] text-white font-extrabold rounded-xl transition-all shadow-md shadow-[#00D26A]/20 flex items-center justify-center gap-2 text-sm sm:text-base active:scale-[0.98]"
+                disabled={isInitiatingPayment}
+                className="w-full py-3.5 bg-[#00D26A] hover:bg-[#00b85c] disabled:opacity-75 disabled:cursor-not-allowed text-white font-extrabold rounded-xl transition-all shadow-md shadow-[#00D26A]/20 flex items-center justify-center gap-2 text-sm sm:text-base active:scale-[0.98]"
               >
                 <Smartphone className="w-5 h-5" />
-                <span>Pay with M-Pesa</span>
+                <span>{isInitiatingPayment ? 'Sending M-Pesa Prompt...' : 'Pay with M-Pesa'}</span>
               </button>
 
               <div className="text-center pt-1">
@@ -1274,7 +1319,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
                 Processing Payment
               </h2>
               <p className="text-xs sm:text-sm font-semibold text-slate-700">
-                Please complete the M-Pesa prompt on your phone.
+                {paymentStatusMessage || 'Please complete the M-Pesa prompt on your phone.'}
               </p>
               <p className="text-xs text-slate-400 italic">
                 Waiting for M-Pesa payment confirmation...
@@ -1335,9 +1380,16 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
                 </div>
               </div>
 
-              <span className="font-extrabold text-slate-900 text-sm">
-                {selectedPaper.price}
-              </span>
+              <div className="text-right">
+                <span className="font-extrabold text-slate-900 text-sm block">
+                  {selectedPaper.price}
+                </span>
+                {mpesaReceipt && (
+                  <span className="text-[10px] font-mono text-emerald-800 bg-emerald-100/90 border border-emerald-200 px-1.5 py-0.5 rounded mt-0.5 inline-block">
+                    {mpesaReceipt}
+                  </span>
+                )}
+              </div>
             </div>
 
             {/* Password Protection Security Notice & Ownership Disclaimer */}
