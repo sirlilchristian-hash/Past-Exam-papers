@@ -1,0 +1,8 @@
+{
+  "name": "ExamPapers",
+  "description": "ExamPapers — University past examination papers repository, automated M-Pesa delivery, and student affiliate program by GodreryTone Publishers Ltd.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
