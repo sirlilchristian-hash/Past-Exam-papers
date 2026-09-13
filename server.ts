@@ -402,6 +402,21 @@ function normalizeKenyanPhone(phoneInput: string): string | null {
 
 // STAGE 1: Real M-Pesa Daraja STK Push Initiation Endpoint
 app.post("/api/mpesa/stkpush", async (req, res) => {
+  // 0. Check Server M-Pesa Daraja Credentials early to avoid DB writes if missing
+  const consumerKey = process.env.MPESA_CONSUMER_KEY;
+  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
+  const passkey = process.env.MPESA_PASSKEY;
+  const shortcode = process.env.MPESA_SHORTCODE || '174379';
+  const mpesaEnv = (process.env.MPESA_ENV || 'sandbox').toLowerCase();
+  const callbackUrl = process.env.MPESA_CALLBACK_URL;
+
+  if (!consumerKey || !consumerSecret || !callbackUrl) {
+    return res.status(500).json({
+      success: false,
+      error: "M-Pesa configuration is incomplete. MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, and MPESA_CALLBACK_URL are required."
+    });
+  }
+
   const { paper_id, paperId, first_name, firstName, studentFirstName, second_name, secondName, studentSecondName, phone } = req.body;
 
   const targetPaperId = paper_id || paperId;
@@ -520,25 +535,6 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       return res.status(500).json({ success: false, error: "Failed to initialize payment tracking." });
     }
     const paymentId = newPayment.id;
-
-    // 7. Check Server M-Pesa Daraja Credentials
-    const consumerKey = process.env.MPESA_CONSUMER_KEY;
-    const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
-    const passkey = process.env.MPESA_PASSKEY;
-    const shortcode = process.env.MPESA_SHORTCODE || '174379';
-    const mpesaEnv = (process.env.MPESA_ENV || 'sandbox').toLowerCase();
-    const callbackUrl = process.env.MPESA_CALLBACK_URL || 'https://example.com/api/mpesa/callback';
-
-    if (!consumerKey || !consumerSecret) {
-      // Revert newly created pending payment & order (preserve customer)
-      await supabaseAdmin.from("payments").delete().eq("id", paymentId);
-      await supabaseAdmin.from("Orders").delete().eq("id", orderId);
-
-      return res.status(400).json({
-        success: false,
-        error: "Server M-Pesa Daraja credentials (MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET) are not configured on the server."
-      });
-    }
 
     // 8. Safaricom Daraja STK Push Execution
     const baseUrl = mpesaEnv === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke';
@@ -821,7 +817,7 @@ app.get("/api/orders/:orderId/status", async (req, res) => {
   try {
     const { data: order, error: orderErr } = await supabaseAdmin
       .from("Orders")
-      .select("id, status, amount, customer_id, paper_id")
+      .select("id, status")
       .eq("id", orderId)
       .maybeSingle();
 
@@ -831,7 +827,7 @@ app.get("/api/orders/:orderId/status", async (req, res) => {
 
     const { data: payment } = await supabaseAdmin
       .from("payments")
-      .select("id, status, mpesa_receipt, amount, phone")
+      .select("status, mpesa_receipt")
       .eq("order_id", orderId)
       .maybeSingle();
 
@@ -841,7 +837,7 @@ app.get("/api/orders/:orderId/status", async (req, res) => {
       orderStatus: order.status,
       paymentStatus: payment?.status || 'pending',
       isPaid: order.status === 'paid',
-      mpesaReceipt: payment?.mpesa_receipt || null,
+      mpesaReceipt: order.status === 'paid' ? (payment?.mpesa_receipt || null) : null,
     });
   } catch (err: any) {
     console.error("Error checking order status:", err);
@@ -878,15 +874,20 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
     }
 
     try {
-      await supabaseAdmin
+      const { error: insertErr } = await supabaseAdmin
         .from("downloads")
-        .upsert({
+        .insert({
           order_id: order.id,
           paper_id: order.paper_id,
           downloaded_at: new Date().toISOString()
-        }, { onConflict: 'order_id' });
+        });
+      
+      // We purposefully ignore unique_violation errors (code '23505') to allow re-downloads
+      if (insertErr && insertErr.code !== '23505') {
+        console.warn("Notice: downloads record creation issue:", insertErr);
+      }
     } catch (dlErr) {
-      console.warn("Notice: downloads record creation skipped/logged:", dlErr);
+      console.warn("Notice: downloads record exception:", dlErr);
     }
 
     const { data: signedData, error: signErr } = await supabaseAdmin
