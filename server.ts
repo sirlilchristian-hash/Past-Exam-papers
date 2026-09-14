@@ -41,7 +41,17 @@ const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
 // Increase body limit for base64 image uploads
 app.use(express.json({ limit: '50mb' }));
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+let aiClient: GoogleGenAI | null = null;
+function getAiClient() {
+  if (!aiClient) {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("GEMINI_API_KEY is not configured.");
+    }
+    aiClient = new GoogleGenAI({ apiKey: key });
+  }
+  return aiClient;
+}
 
 // API Route for Digitizing Exam Paper
 app.post("/api/digitize-paper", async (req, res) => {
@@ -50,6 +60,13 @@ app.post("/api/digitize-paper", async (req, res) => {
 
     if (!imageBase64) {
       return res.status(400).json({ error: "No image provided" });
+    }
+
+    let ai;
+    try {
+      ai = getAiClient();
+    } catch (err: any) {
+      return res.status(503).json({ error: "AI processing is currently disabled because the Gemini API key is not configured on the server." });
     }
 
     const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "");
