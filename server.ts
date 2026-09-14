@@ -618,6 +618,15 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
 
     if (stkRes.ok && stkData.ResponseCode === "0") {
       // Safaricom accepted STK Push request
+      
+      console.log("[M-Pesa STK Push Debug] Safaricom Accepted Request:", {
+        ResponseCode: stkData.ResponseCode,
+        ResponseDescription: stkData.ResponseDescription,
+        MerchantRequestID: stkData.MerchantRequestID,
+        CheckoutRequestID: stkData.CheckoutRequestID,
+        CustomerMessage: stkData.CustomerMessage
+      });
+
       const checkoutRequestId = stkData.CheckoutRequestID;
       const merchantRequestId = stkData.MerchantRequestID;
 
