@@ -422,15 +422,21 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
   // 0. Check Server M-Pesa Daraja Credentials early to avoid DB writes if missing
   const consumerKey = process.env.MPESA_CONSUMER_KEY;
   const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
-  const passkey = process.env.MPESA_PASSKEY;
-  const shortcode = process.env.MPESA_SHORTCODE || '174379';
   const mpesaEnv = (process.env.MPESA_ENV || 'sandbox').toLowerCase();
+  const isSandbox = mpesaEnv === 'sandbox';
+  
+  // Safaricom Sandbox Official Constants
+  const SANDBOX_SHORTCODE = '174379';
+  const SANDBOX_PASSKEY = 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
+
+  const shortcode = isSandbox ? SANDBOX_SHORTCODE : process.env.MPESA_SHORTCODE;
+  const passkey = isSandbox ? SANDBOX_PASSKEY : process.env.MPESA_PASSKEY;
   const callbackUrl = process.env.MPESA_CALLBACK_URL;
 
-  if (!consumerKey || !consumerSecret || !callbackUrl) {
+  if (!consumerKey || !consumerSecret || !callbackUrl || !shortcode || !passkey) {
     return res.status(500).json({
       success: false,
-      error: "M-Pesa configuration is incomplete. MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, and MPESA_CALLBACK_URL are required."
+      error: "M-Pesa configuration is incomplete. Missing required credentials for the active environment."
     });
   }
 
