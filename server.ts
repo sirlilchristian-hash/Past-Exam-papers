@@ -640,6 +640,109 @@ app.post("/api/papers", requireAdmin, requireRole(["super_admin", "content_admin
   }
 });
 
+app.post("/api/admin/papers/:id/testdownload", async (req, res) => {
+  console.log("Admin download hit:", req.params.id);
+  const { id } = req.params;
+  const { password } = req.body;
+  console.log("Password present:", !!password);
+  if (!password) {
+    return res.status(400).json({ error: "Password is required" });
+  }
+
+  try {
+    const { data: paper, error: paperErr } = await supabaseAdmin
+      .from("Papers")
+      .select("id, file_path, paper_title, unit_code")
+      .eq("id", id)
+      .maybeSingle();
+
+    console.log("Paper lookup:", { found: !!paper, error: paperErr });
+    if (paperErr || !paper || !paper.file_path) {
+      return res.status(404).json({ error: "Paper file not found in repository." });
+    }
+
+    const { data: fileData, error: downloadErr } = await supabaseAdmin
+      .storage
+      .from("Papers")
+      .download(paper.file_path);
+
+    console.log("Storage download:", { found: !!fileData, error: downloadErr });
+    if (downloadErr || !fileData) {
+      console.error("Error downloading PDF from Storage:", downloadErr);
+      return res.status(500).json({ error: "Failed to retrieve the document." });
+    }
+
+    const arrayBuffer = await fileData.arrayBuffer();
+    const pdfUint8 = new Uint8Array(arrayBuffer);
+    console.log("File loaded to Uint8Array. Size:", pdfUint8.length);
+    
+    const encryptedBytes = await encryptPDF(pdfUint8, password, { algorithm: 'RC4' });
+    console.log("File encrypted. Size:", encryptedBytes.length);
+    
+    const outputFilename = `${paper.unit_code}_Exam.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+    
+    return res.send(Buffer.from(encryptedBytes));
+  } catch (err) {
+    console.error("Error generating protected admin download:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+app.get("/api/testpapers", async (req, res) => {
+  const { data } = await supabaseAdmin.from("Papers").select("*").limit(1).single();
+  res.json(data);
+});
+app.post("/api/admin/papers/:id/download", requireAdmin, requireRole(["super_admin", "content_admin"]), async (req, res) => {
+  console.log("Admin download hit:", req.params.id);
+  const { id } = req.params;
+  const { password } = req.body;
+  console.log("Password present:", !!password);
+  if (!password) {
+    return res.status(400).json({ error: "Password is required" });
+  }
+
+  try {
+    const { data: paper, error: paperErr } = await supabaseAdmin
+      .from("Papers")
+      .select("id, file_path, paper_title, unit_code")
+      .eq("id", id)
+      .maybeSingle();
+
+    console.log("Paper lookup:", { found: !!paper, error: paperErr });
+    if (paperErr || !paper || !paper.file_path) {
+      return res.status(404).json({ error: "Paper file not found in repository." });
+    }
+
+    const { data: fileData, error: downloadErr } = await supabaseAdmin
+      .storage
+      .from("Papers")
+      .download(paper.file_path);
+
+    console.log("Storage download:", { found: !!fileData, error: downloadErr });
+    if (downloadErr || !fileData) {
+      console.error("Error downloading PDF from Storage:", downloadErr);
+      return res.status(500).json({ error: "Failed to retrieve the document." });
+    }
+
+    const arrayBuffer = await fileData.arrayBuffer();
+    const pdfUint8 = new Uint8Array(arrayBuffer);
+    console.log("File loaded to Uint8Array. Size:", pdfUint8.length);
+    
+    const encryptedBytes = await encryptPDF(pdfUint8, password, { algorithm: 'RC4' });
+    console.log("File encrypted. Size:", encryptedBytes.length);
+    
+    const outputFilename = `${paper.unit_code}_Exam.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+    
+    return res.send(Buffer.from(encryptedBytes));
+  } catch (err) {
+    console.error("Error generating protected admin download:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.post("/api/papers/:id/download", async (req, res) => {
   res.status(403).json({ error: "Downloads must be processed through the secure order entitlement flow." });
 });
@@ -661,6 +764,81 @@ function normalizeKenyanPhone(phoneInput: string): string | null {
 }
 
 // STAGE 1: Real M-Pesa Daraja STK Push Initiation Endpoint
+// STAGE 1 (Alternative): Manual WhatsApp Order Creation
+app.post("/api/orders/whatsapp", async (req, res) => {
+  try {
+    const { paper_id, first_name, second_name, phone } = req.body;
+
+    const targetPaperId = (paper_id || '').trim();
+    const targetFirstName = (first_name || '').trim();
+    const targetSecondName = (second_name || '').trim();
+
+    if (!targetPaperId || !targetFirstName || !targetSecondName) {
+      return res.status(400).json({ success: false, error: "Missing required fields." });
+    }
+
+    let normalizedPhone = '';
+    if (phone) {
+      normalizedPhone = normalizeKenyanPhone(phone) || phone.trim();
+    }
+
+    const { data: dbPaper, error: paperErr } = await supabaseAdmin
+      .from("Papers")
+      .select("*")
+      .eq("id", targetPaperId)
+      .single();
+
+    if (paperErr || !dbPaper) {
+      return res.status(404).json({ success: false, error: "Paper not found." });
+    }
+
+    let customerId = null;
+    if (normalizedPhone) {
+      const { data: existingCustomer } = await supabaseAdmin
+        .from("customers")
+        .select("id")
+        .eq("phone", normalizedPhone)
+        .maybeSingle();
+      if (existingCustomer?.id) {
+        customerId = existingCustomer.id;
+        await supabaseAdmin.from("customers").update({ first_name: targetFirstName, second_name: targetSecondName }).eq("id", customerId);
+      }
+    }
+    
+    if (!customerId) {
+       const { data: newCustomer, error: createCustErr } = await supabaseAdmin
+        .from("customers")
+        .insert({
+          first_name: targetFirstName,
+          second_name: targetSecondName,
+          phone: normalizedPhone || null
+        })
+        .select("id")
+        .single();
+        if (createCustErr) throw createCustErr;
+        customerId = newCustomer.id;
+    }
+
+    const { data: newOrder, error: orderErr } = await supabaseAdmin
+      .from("Orders")
+      .insert({
+        customer_id: customerId,
+        paper_id: targetPaperId,
+        amount: Number(dbPaper.price) || 0,
+        status: 'pending'
+      })
+      .select("id")
+      .single();
+
+    if (orderErr) throw orderErr;
+
+    return res.json({ success: true, orderId: newOrder.id });
+  } catch (err) {
+    console.error("WhatsApp order creation error:", err);
+    return res.status(500).json({ success: false, error: "Internal server error." });
+  }
+});
+
 app.post("/api/mpesa/stkpush", async (req, res) => {
   // 0. Check Server M-Pesa Daraja Credentials early to avoid DB writes if missing
   const consumerKey = process.env.MPESA_CONSUMER_KEY;

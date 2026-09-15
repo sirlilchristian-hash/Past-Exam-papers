@@ -252,6 +252,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   // Add/Edit & Document Viewer Modals
   const [isPaperModalOpen, setIsPaperModalOpen] = useState<boolean>(false);
   const [editingPaper, setEditingPaper] = useState<Paper | null>(null);
+  const [downloadAdminPaper, setDownloadAdminPaper] = useState<Paper | null>(null);
+  const [downloadAdminPassword, setDownloadAdminPassword] = useState<string>('');
+  const [isDownloadingAdmin, setIsDownloadingAdmin] = useState<boolean>(false);
   const [viewingPaper, setViewingPaper] = useState<Paper | null>(null);
   const [viewingPage, setViewingPage] = useState<number>(1);
   const [selectedInquiryTx, setSelectedInquiryTx] = useState<TransactionRecord | null>(null);
@@ -534,6 +537,42 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       fileInputRef.current.value = '';
     }
     setIsPaperModalOpen(true);
+  };
+
+  const handleAdminDownload = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!downloadAdminPaper || !downloadAdminPassword.trim()) return;
+    setIsDownloadingAdmin(true);
+    try {
+      const res = await fetch(`/api/admin/papers/${downloadAdminPaper.id}/download`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('admin_token')}`
+        },
+        body: JSON.stringify({ password: downloadAdminPassword.trim() })
+      });
+      if (!res.ok) {
+         const errText = await res.text();
+         throw new Error(errText);
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${downloadAdminPaper.unit_code || 'Document'}_Exam.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      setDownloadAdminPaper(null);
+      setDownloadAdminPassword('');
+    } catch (e) {
+      console.error(e);
+      alert("Failed to download document.");
+    } finally {
+      setIsDownloadingAdmin(false);
+    }
   };
 
   const handleOpenEditModal = (paper: Paper) => {
@@ -1672,6 +1711,17 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                                       </button>
                                       <button
                                         type="button"
+                                        onClick={() => {
+                                          setDownloadAdminPaper(paper);
+                                          setDownloadAdminPassword('');
+                                        }}
+                                        className="p-1.5 bg-emerald-950/50 hover:bg-emerald-900/70 text-emerald-400 rounded-lg transition-colors inline-block"
+                                        title="Download Document"
+                                      >
+                                        <Download className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        type="button"
                                         onClick={() => handleDeletePaper(paper)}
                                         className="p-1.5 bg-rose-950/50 hover:bg-rose-900/70 text-rose-400 rounded-lg transition-colors inline-block"
                                         title="Remove Paper from Catalog"
@@ -2179,6 +2229,56 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       </div>
 
       {/* Add / Edit Exam Paper Modal with Structured Form Validation */}
+            {/* Admin Download Modal */}
+      {downloadAdminPaper && (
+        <div className="fixed inset-0 z-60 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-slate-900 border border-slate-800 text-slate-100 rounded-3xl p-6 sm:p-7 max-w-sm w-full space-y-5 animate-fadeIn shadow-2xl my-8">
+            <div className="flex items-center gap-2.5 pb-3 border-b border-slate-800">
+              <div className="w-8 h-8 rounded-xl bg-[#00D26A]/20 text-[#00D26A] flex items-center justify-center font-bold">
+                <Download className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-base font-extrabold text-white">Download Protected Document</h3>
+              </div>
+            </div>
+            
+            <form onSubmit={handleAdminDownload} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide mb-1">Enter PDF Password</label>
+                <input
+                  type="text"
+                  value={downloadAdminPassword}
+                  onChange={(e) => setDownloadAdminPassword(e.target.value)}
+                  className="w-full bg-slate-950/50 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:border-[#00D26A] focus:ring-1 focus:ring-[#00D26A] outline-none"
+                  placeholder="e.g. Kamau"
+                  required
+                />
+                <p className="text-[11px] text-slate-500 mt-2 leading-tight">This password will be used to encrypt the downloaded PDF file. It is not saved.</p>
+              </div>
+              <div className="flex justify-end gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setDownloadAdminPaper(null)}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isDownloadingAdmin || !downloadAdminPassword.trim()}
+                  className="px-4 py-2 bg-[#00D26A] hover:bg-[#00b359] text-slate-950 text-sm font-extrabold rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                >
+                  {isDownloadingAdmin ? (
+                    <span className="w-4 h-4 border-2 border-slate-950/20 border-t-slate-950 rounded-full animate-spin block"></span>
+                  ) : null}
+                  Download Document
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {isPaperModalOpen && (
         <div className="fixed inset-0 z-60 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
           <div className="bg-slate-900 border border-slate-800 text-slate-100 rounded-3xl p-6 sm:p-7 max-w-lg w-full space-y-5 animate-fadeIn shadow-2xl my-8">
@@ -2590,7 +2690,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               <div className="flex items-center gap-2 shrink-0">
                 <button
                   onClick={() => {
-                    alert(`Downloading administrator copy of ${viewingPaper.unit_code} (${viewingPaper.paper_title})`);
+                    setDownloadAdminPaper(viewingPaper);
+                    setDownloadAdminPassword('');
                   }}
                   className="hidden sm:flex px-3.5 py-2 bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 font-black text-xs rounded-xl items-center gap-1.5 shadow transition-all"
                 >
@@ -2933,7 +3034,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               </button>
               <button
                 onClick={() => {
-                  alert(`Re-downloading PDF copy of ${selectedInquiryTx.unit_code} for student ${selectedInquiryTx.studentFirstName} ${selectedInquiryTx.studentSecondName}`);
+                  alert("Student PDF copies cannot be re-downloaded securely. Ask the student to re-request.");
                 }}
                 className="hidden sm:flex px-4 py-2.5 bg-[#00D26A] text-slate-950 font-black text-xs rounded-xl hover:bg-[#00b85c] items-center gap-1.5"
               >
