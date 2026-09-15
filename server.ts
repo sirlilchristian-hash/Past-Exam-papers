@@ -929,6 +929,84 @@ function parseMpesaTransactionDate(raw: string | number): string {
 }
 
 // STAGE 2: Real M-Pesa Daraja Asynchronous Callback Endpoint
+// TEMPORARY M-PESA SUCCESS TEST ROUTE - REMOVE BEFORE PRODUCTION
+app.post("/api/admin/test/mpesa-success/:orderId", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    
+    const { data: dbOrder, error: orderErr } = await supabaseAdmin
+      .from("Orders")
+      .select("*")
+      .eq("id", orderId)
+      .maybeSingle();
+
+    if (orderErr || !dbOrder) {
+      return res.status(404).json({ success: false, error: "Order not found" });
+    }
+
+    const { data: dbPayment, error: payErr } = await supabaseAdmin
+      .from("payments")
+      .select("*")
+      .eq("order_id", orderId)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (payErr || !dbPayment) {
+      return res.status(404).json({ success: false, error: "No pending payment found for this order" });
+    }
+
+    if (!dbPayment.checkout_request_id) {
+      return res.status(400).json({ success: false, error: "Pending payment has no checkout_request_id (STK Push was likely not initiated)." });
+    }
+
+    const simulatedPayload = {
+      Body: {
+        stkCallback: {
+          MerchantRequestID: dbPayment.merchant_request_id || `TEST_MERCH_${Date.now()}`,
+          CheckoutRequestID: dbPayment.checkout_request_id,
+          ResultCode: 0,
+          ResultDesc: "The service request is processed successfully.",
+          CallbackMetadata: {
+            Item: [
+              { Name: "Amount", Value: dbOrder.amount },
+              { Name: "MpesaReceiptNumber", Value: "TESTRECEIPT123" },
+              { Name: "PhoneNumber", Value: dbPayment.phone },
+              { Name: "TransactionDate", Value: 20260915123000 }
+            ]
+          }
+        }
+      }
+    };
+
+    const callbackRes = await fetch(`http://127.0.0.1:${PORT}/api/mpesa/callback`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(simulatedPayload)
+    });
+
+    const responseText = await callbackRes.text();
+
+    if (!callbackRes.ok) {
+      return res.status(callbackRes.status).json({ success: false, error: "Internal callback failed", details: responseText });
+    }
+
+    return res.json({ 
+      success: true, 
+      message: "Simulated M-Pesa callback processed successfully.", 
+      simulatedPayload,
+      callbackResponse: responseText 
+    });
+
+  } catch (err: any) {
+    console.error("Test M-Pesa Callback Error:", err);
+    return res.status(500).json({ success: false, error: "Internal server error" });
+  }
+});
+
 app.post("/api/mpesa/callback", async (req, res) => {
   try {
     const callbackData = req.body?.Body?.stkCallback || req.body?.stkCallback || req.body;
