@@ -1,6 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import jsPDF from 'jspdf';
-import { encryptPDF } from '@pdfsmaller/pdf-encrypt';
 import {
   Search,
   ArrowLeft,
@@ -514,208 +512,30 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
 
   // Handle Trigger Real Encrypted PDF File Download (Protected & Uneditable Format)
   const handleDownloadPaper = async () => {
-    if (!selectedPaper) return;
-
-    // Use jsPDF to generate an official uneditable PDF document
-    const doc = new jsPDF({
-      orientation: 'portrait',
-      unit: 'mm',
-      format: 'a4',
-    });
-
-    const userPass = firstName.trim();
-    const docTitle = `${selectedPaper.unit_code} - ${selectedPaper.paper_title}`;
-
-    // PDF Document Properties & Metadata
-    doc.setProperties({
-      title: `This document belongs to ${firstName} (${selectedPaper.unit_code})`,
-      subject: `This document is owned by ${firstName} ${secondName}`,
-      author: `${firstName} ${secondName}`,
-      creator: 'GodreryTone Publishers Ltd',
-    });
-
-    // Header styling
-    doc.setFillColor(3, 29, 18); // Dark Emerald #031d12
-    doc.rect(0, 0, 210, 38, 'F');
-
-    const docData: any = (selectedPaper as any).digitizedContent || (typeof (selectedPaper as any).file_path === 'object' ? (selectedPaper as any).file_path : null);
-
-    doc.setTextColor(0, 210, 106); // Accent Green
-    doc.setFontSize(16);
-    doc.setFont('helvetica', 'bold');
-    doc.text(docData?.university?.toUpperCase() || 'MOUNT KENYA UNIVERSITY (MKU)', 105, 14, { align: 'center' });
-
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    const examSubtitle = docData?.examination 
-      ? docData.examination
-      : 'PUBLISHED & VERIFIED BY GODRERYTONE PUBLISHERS LTD';
-    doc.text(examSubtitle, 105, 22, { align: 'center' });
-
-    doc.setFontSize(8);
-    doc.setTextColor(161, 203, 178);
-    const examCourse = docData?.course
-      ? `${docData.course} — ${docData.type || 'EXAMINATION'}`
-      : 'READ-ONLY UNEDITABLE EXAMINATION PAPER & MARKING SCHEME';
-    doc.text(examCourse, 105, 29, { align: 'center' });
-
-    // Document Metadata Bar
-    doc.setFillColor(245, 247, 246);
-    doc.rect(12, 44, 186, 36, 'F');
-    doc.setDrawColor(200, 210, 205);
-    doc.rect(12, 44, 186, 36, 'S');
-
-    doc.setTextColor(15, 23, 42);
-    doc.setFontSize(9.5);
-    doc.setFont('helvetica', 'bold');
-    doc.text(`Course Unit: ${docData?.unitTitle || selectedPaper.paper_title}`, 18, 51);
-    doc.text(`Unit Code: ${docData?.unit_code || selectedPaper.unit_code}`, 18, 58);
-    doc.text(`Exam Year: ${docData?.date || (typeof selectedPaper.file_path === 'string' ? selectedPaper.file_path : '2024')}`, 18, 65);
-
-    const currentTime = new Date().toLocaleString();
-    doc.text(`Purchaser: ${firstName} ${secondName}`, 115, 51);
-    doc.text(`Phone: ${phone}`, 115, 58);
-    doc.text(`Amount Paid: ${selectedPaper.price} | Time: ${currentTime}`, 115, 65);
-
-    // Ownership Disclaimer inside PDF
-    doc.setTextColor(180, 83, 9); // Amber/orange tone
-    doc.setFontSize(8);
-    doc.setFont('helvetica', 'bold');
-    doc.text(`DISCLAIMER: THIS DOCUMENT IS OWNED BY ${firstName.toUpperCase()} (${firstName} ${secondName}).`, 18, 73);
-
-    let currentY = 82;
-
-    if (docData?.instructions) {
-      doc.setTextColor(15, 23, 42);
-      doc.setFontSize(9);
-      doc.setFont('helvetica', 'bold');
-      const instructions = `INSTRUCTIONS: ${docData.instructions}`;
-      const splitInst = doc.splitTextToSize(instructions, 180);
-      doc.text(splitInst, 12, currentY);
-      currentY += (splitInst.length * 5) + 4;
-    }
-
-    if (docData?.sections) {
-      docData.sections.forEach((section: any) => {
-        if (currentY > 260) {
-           doc.addPage();
-           currentY = 20;
-        }
-        if (section.name) {
-          doc.setTextColor(0, 120, 60);
-          doc.setFontSize(11);
-          doc.setFont('helvetica', 'bold');
-          doc.text(section.name, 12, currentY);
-          currentY += 8;
-        }
-        
-        doc.setTextColor(30, 41, 59);
-        doc.setFontSize(9);
-        doc.setFont('helvetica', 'normal');
-        
-        section.questions?.forEach((q: any) => {
-          if (currentY > 260) { doc.addPage(); currentY = 20; }
-          doc.setFont('helvetica', 'bold');
-          doc.text(`${q.questionNumber || ''} ${q.totalMarks ? `(${q.totalMarks})` : ''}`, 12, currentY);
-          currentY += 6;
-          
-          doc.setFont('helvetica', 'normal');
-          if (q.text) {
-            const splitText = doc.splitTextToSize(q.text, 180);
-            doc.text(splitText, 12, currentY);
-            currentY += (splitText.length * 5) + 2;
-          }
-          
-          q.subQuestions?.forEach((sq: any) => {
-             if (currentY > 260) { doc.addPage(); currentY = 20; }
-             const marks = sq.marks ? ` [${sq.marks}]` : '';
-             const sqText = `${sq.label || ''} ${sq.text || ''}${marks}`;
-             const splitSq = doc.splitTextToSize(sqText, 175);
-             doc.text(splitSq, 16, currentY);
-             currentY += (splitSq.length * 5) + 2;
-             
-             sq.subSubQuestions?.forEach((ssq: any) => {
-                if (currentY > 260) { doc.addPage(); currentY = 20; }
-                const ssMarks = ssq.marks ? ` [${ssq.marks}]` : '';
-                const ssqText = `${ssq.label || ''} ${ssq.text || ''}${ssMarks}`;
-                const splitSsq = doc.splitTextToSize(ssqText, 170);
-                doc.text(splitSsq, 20, currentY);
-                currentY += (splitSsq.length * 5) + 2;
-             });
-          });
-          currentY += 4;
-        });
-      });
-    } else {
-      // Section A
-      doc.setTextColor(0, 120, 60);
-      doc.setFontSize(11);
-      doc.setFont('helvetica', 'bold');
-      doc.text('SECTION A: CONTINUOUS ASSESSMENT & COMPULSORY QUESTIONS (40 MARKS)', 12, 89);
-  
-      doc.setTextColor(30, 41, 59);
-      doc.setFontSize(9);
-      doc.setFont('helvetica', 'normal');
-  
-      const sectionA = [
-        `Q1. (a) Define the core foundational principles governing ${selectedPaper.paper_title}. [5 Marks]`,
-        `    (b) Outline four primary methodologies and practical applications in ${selectedPaper.unit_code}. [10 Marks]`,
-        `    (c) Explain the systemic analytical frameworks utilized in Mount Kenya University exams. [15 Marks]`,
-        `    (d) State two fundamental theorems or models relevant to this course unit. [10 Marks]`,
-      ];
-  
-      currentY = 96;
-      sectionA.forEach((line) => {
-        doc.text(line, 12, currentY);
-        currentY += 7;
-      });
-  
-      // Section B
-      doc.setTextColor(0, 120, 60);
-      doc.setFontSize(11);
-      doc.setFont('helvetica', 'bold');
-      doc.text('SECTION B: ANSWER ANY TWO QUESTIONS (30 MARKS)', 12, currentY + 6);
-  
-      currentY += 14;
-      doc.setTextColor(30, 41, 59);
-      doc.setFontSize(9);
-      doc.setFont('helvetica', 'normal');
-  
-      const sectionB = [
-        `Q2. Evaluate the structural implementation and strategic case studies of ${selectedPaper.paper_title}. [15 Marks]`,
-        `Q3. Derive and prove the mathematical or theoretical formulations required in ${selectedPaper.unit_code}. [15 Marks]`,
-        `Q4. Discuss recent technological integrations and industry innovations across Kenya. [15 Marks]`,
-      ];
-  
-      sectionB.forEach((line) => {
-        doc.text(line, 12, currentY);
-        currentY += 7;
-      });
-    }
-
-    // Watermark & Footer Security
-    doc.setDrawColor(220, 225, 222);
-    doc.line(12, 270, 198, 270);
-
-    doc.setFontSize(8);
-    doc.setTextColor(100, 116, 139);
-    doc.text(`Official Exam Paper • ${docTitle} • Password Protected (${userPass})`, 105, 276, { align: 'center' });
-    doc.text('Copyright © GodreryTone Publishers Ltd. Password Encrypted Document.', 105, 281, { align: 'center' });
-
-    // Export raw PDF bytes
-    const pdfArrayBuffer = doc.output('arraybuffer');
-    const pdfUint8 = new Uint8Array(pdfArrayBuffer);
-
-    // Descriptive filename carrying ownership
-    const downloadFileName = `This_document_belongs_to_${firstName.trim().replace(/\s+/g, '_')}_${selectedPaper.unit_code}.pdf`;
-
+    if (!selectedPaper || !currentOrderId) return;
     try {
-      // Encrypt PDF with purchaser's first name as password
-      const encryptedBytes = await encryptPDF(pdfUint8, userPass, { algorithm: 'RC4' });
+      setHasDownloaded(false);
+      
+      const res = await fetch(`/api/orders/${currentOrderId}/download`);
+      
+      if (!res.ok) {
+        // Handle JSON error response if possible, otherwise generic text
+        let errorMsg = "Failed to securely download paper.";
+        try {
+          const errData = await res.json();
+          if (errData.error) errorMsg = errData.error;
+        } catch(e) {}
+        alert(errorMsg);
+        return;
+      }
 
-      // Trigger download of encrypted PDF blob
-      const blob = new Blob([encryptedBytes], { type: 'application/pdf' });
+      // Read the encrypted PDF blob directly from the response
+      const blob = await res.blob();
+      
+      // Use the purchaser's first name in the filename
+      const downloadFileName = `This_document_belongs_to_${firstName.trim().replace(/\s+/g, '_')}_${selectedPaper.unit_code}.pdf`;
+      
+      // Trigger download
       const downloadUrl = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = downloadUrl;
@@ -724,26 +544,13 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(downloadUrl);
-      
-      if (currentOrderId) {
-        try {
-          await fetch(`/api/orders/${currentOrderId}/download`);
-        } catch(e) {
-          console.error("Failed to record order download:", e);
-        }
-      }
-    } catch (err) {
-      console.error('PDF Encryption fallback:', err);
-      doc.save(downloadFileName);
-      if (currentOrderId) {
-        try {
-          await fetch(`/api/orders/${currentOrderId}/download`);
-        } catch(e) {}
-      }
-    }
 
-    setHasDownloaded(true);
-    setStep(6);
+      setHasDownloaded(true);
+      setStep(6);
+    } catch (err) {
+      console.error('PDF Download Error:', err);
+      alert("Network error during secure download. Please check your connection.");
+    }
   };
 
   const handleResetSearch = () => {

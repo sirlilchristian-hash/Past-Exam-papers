@@ -71,7 +71,10 @@ export async function savePaperUnified(
     // 1. Save to backend API (reliable persistence)
     const res = await fetch('/api/papers', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('admin_token')}` 
+      },
       body: JSON.stringify(paperData),
     });
 
@@ -97,7 +100,10 @@ export async function updatePaperUnified(
   try {
     const res = await fetch(`/api/papers/${id}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('admin_token')}` 
+      },
       body: JSON.stringify(updates),
     });
 
@@ -120,7 +126,10 @@ export async function deletePaperUnified(
   id: string
 ): Promise<{ success: boolean; error: string | null }> {
   try {
-    const res = await fetch(`/api/papers/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/papers/${id}`, { 
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` }
+    });
     if (!res.ok) {
       return { success: false, error: 'Failed to delete paper' };
     }

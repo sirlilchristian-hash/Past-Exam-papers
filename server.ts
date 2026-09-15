@@ -2,9 +2,12 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import dotenv from "dotenv";
 import multer from "multer";
 import { createClient } from "@supabase/supabase-js";
+import { encryptPDF } from "@pdfsmaller/pdf-encrypt";
 
 dotenv.config();
 
@@ -53,11 +56,226 @@ function getAiClient() {
   return aiClient;
 }
 
+// Environment variables for Admin
+const JWT_SECRET = process.env.JWT_SECRET || "default-dev-jwt-secret-do-not-use-in-prod";
+
+// Middleware to protect admin routes
+interface AdminJwtPayload {
+  account_id: string;
+  role: string;
+}
+
+function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized: Missing or invalid token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as AdminJwtPayload;
+    res.locals.admin = decoded;
+    next();
+  } catch (err) {
+    console.warn(`[Admin Auth] Failed access attempt to ${req.originalUrl} from ${req.ip}`);
+    return res.status(403).json({ error: "Forbidden: Invalid token" });
+  }
+}
+
+function requireRole(allowedRoles: string[]) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const admin = res.locals.admin as AdminJwtPayload | undefined;
+    if (!admin) {
+      return res.status(401).json({ error: "Unauthorized: No admin session" });
+    }
+    if (!allowedRoles.includes(admin.role)) {
+      return res.status(403).json({ error: `Forbidden: Requires one of roles: ${allowedRoles.join(', ')}` });
+    }
+    next();
+  };
+}
+
+// Admin login endpoint
+app.post("/api/admin/login", async (req, res) => {
+  const { accountId, password } = req.body;
+  if (!accountId || !password) {
+    return res.status(400).json({ error: "Account ID and Password are required" });
+  }
+
+  try {
+    // Check for hardcoded fallback ONLY if DB query fails due to missing table (for initial setup)
+    // Note: In production, the table should exist.
+    const { data: user, error } = await supabaseAdmin
+      .from("admin_users")
+      .select("*")
+      .eq("account_id", accountId)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (error && error.code === '42P01') {
+      // Table doesn't exist, allow fallback to setup
+      console.warn("[Admin Auth] admin_users table missing! Falling back to setup mode.");
+      if (accountId === "admin" && password === "1234") {
+        const token = jwt.sign({ account_id: "admin", role: "super_admin" }, JWT_SECRET, { expiresIn: "12h" });
+        return res.json({ success: true, token, role: "super_admin" });
+      }
+    }
+
+    if (!user) {
+      console.warn(`[Admin Auth] Failed login attempt for ${accountId} from ${req.ip}`);
+      return res.status(401).json({ error: "Incorrect Account ID or Password" });
+    }
+
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      console.warn(`[Admin Auth] Failed login attempt for ${accountId} from ${req.ip}`);
+      return res.status(401).json({ error: "Incorrect Account ID or Password" });
+    }
+
+    const token = jwt.sign({ account_id: user.account_id, role: user.role }, JWT_SECRET, { expiresIn: "12h" });
+    return res.json({ success: true, token, role: user.role });
+  } catch (err) {
+    console.error("[Admin Auth Error]", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// Admin Self-Service: Change Password
+app.post("/api/admin/change-password", requireAdmin, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const admin = res.locals.admin as AdminJwtPayload;
+
+  if (!currentPassword || !newPassword || newPassword.length < 8) {
+    return res.status(400).json({ error: "Valid current and new password (min 8 chars) required." });
+  }
+
+  try {
+    const { data: user } = await supabaseAdmin
+      .from("admin_users")
+      .select("password_hash")
+      .eq("account_id", admin.account_id)
+      .single();
+
+    if (!user || !(await bcrypt.compare(currentPassword, user.password_hash))) {
+      return res.status(401).json({ error: "Incorrect current password." });
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await supabaseAdmin
+      .from("admin_users")
+      .update({ password_hash: newHash })
+      .eq("account_id", admin.account_id);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Admin Change Password Error]", err);
+    res.status(500).json({ error: "Failed to change password." });
+  }
+});
+
+// Super Admin: List Users
+app.get("/api/admin/users", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("admin_users")
+      .select("id, account_id, role, status, created_at")
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch admin users." });
+  }
+});
+
+// Super Admin: Create User
+app.post("/api/admin/users", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  const { accountId, password, role } = req.body;
+  if (!accountId || !password || !role) {
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+  if (role === 'super_admin') {
+    return res.status(403).json({ error: "Cannot create a super_admin via this endpoint." });
+  }
+  if (!['finance_admin', 'content_admin', 'support_admin'].includes(role)) {
+    return res.status(400).json({ error: "Invalid role specified." });
+  }
+
+  try {
+    const password_hash = await bcrypt.hash(password, 12);
+    const { data, error } = await supabaseAdmin
+      .from("admin_users")
+      .insert([{ account_id: accountId, password_hash, role, status: "active" }])
+      .select("id, account_id, role, status, created_at")
+      .single();
+    if (error) throw error;
+    res.json({ success: true, user: data });
+  } catch (err: any) {
+    console.error("Create User Error:", err);
+    res.status(500).json({ error: err.message || "Failed to create user. Ensure Account ID is unique." });
+  }
+});
+
+// Super Admin: Update User Role/Status
+app.patch("/api/admin/users/:accountId", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  const { accountId } = req.params;
+  const { role, status } = req.body;
+  
+  if (accountId === res.locals.admin.account_id) {
+    return res.status(403).json({ error: "Cannot modify your own role or status." });
+  }
+  if (role && role === 'super_admin') {
+    return res.status(403).json({ error: "Cannot promote to super_admin." });
+  }
+  if (role && !['finance_admin', 'content_admin', 'support_admin'].includes(role)) {
+    return res.status(400).json({ error: "Invalid role specified." });
+  }
+
+  try {
+    const updates: any = {};
+    if (role) updates.role = role;
+    if (status) updates.status = status;
+
+    const { data, error } = await supabaseAdmin
+      .from("admin_users")
+      .update(updates)
+      .eq("account_id", accountId)
+      .select("id, account_id, role, status, created_at")
+      .single();
+    if (error) throw error;
+    res.json({ success: true, user: data });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update user." });
+  }
+});
+
+// Super Admin: Reset User Password
+app.post("/api/admin/users/:accountId/reset-password", requireAdmin, requireRole(["super_admin"]), async (req, res) => {
+  const { accountId } = req.params;
+  const { newPassword } = req.body;
+  
+  if (accountId === res.locals.admin.account_id) {
+    return res.status(403).json({ error: "Cannot reset your own password here. Use the Change Password function." });
+  }
+  if (!newPassword || newPassword.length < 8) {
+    return res.status(400).json({ error: "New password must be at least 8 characters." });
+  }
+
+  try {
+    const password_hash = await bcrypt.hash(newPassword, 12);
+    const { error } = await supabaseAdmin
+      .from("admin_users")
+      .update({ password_hash })
+      .eq("account_id", accountId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to reset password." });
+  }
+});
 // API Route for Digitizing Exam Paper
-app.post("/api/digitize-paper", async (req, res) => {
+app.post("/api/digitize-paper", requireAdmin, requireRole(["super_admin", "content_admin"]), async (req, res) => {
   try {
     const { imageBase64, mimeType } = req.body;
-
     if (!imageBase64) {
       return res.status(400).json({ error: "No image provided" });
     }
@@ -114,7 +332,7 @@ app.post("/api/digitize-paper", async (req, res) => {
  * Validates request, uploads PDF to private Supabase Storage bucket "Papers",
  * inserts/updates public."Papers", handles transactional cleanup on DB error.
  */
-app.post("/api/papers/upload", upload.single("pdfFile"), async (req, res) => {
+app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "content_admin"]), upload.single("pdfFile"), async (req, res) => {
   try {
     const paperId = req.body?.paperId?.trim();
     const unitCode = (req.body?.unit_code || req.body?.unitCode || '').trim().toUpperCase();
@@ -382,7 +600,7 @@ app.get("/api/papers", async (req, res) => {
   }
 });
 
-app.delete("/api/papers/:id", async (req, res) => {
+app.delete("/api/papers/:id", requireAdmin, requireRole(["super_admin", "content_admin"]), async (req, res) => {
   const { id } = req.params;
   try {
     const { data: paper } = await supabaseAdmin.from("Papers").select("file_path").eq("id", id).single();
@@ -394,6 +612,31 @@ app.delete("/api/papers/:id", async (req, res) => {
   } catch (e) {
     console.error("DB delete failed:", e);
     res.status(500).json({ error: "Failed to delete paper" });
+  }
+});
+
+app.patch("/api/papers/:id", requireAdmin, requireRole(["super_admin", "content_admin"]), async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  try {
+    const { data, error } = await supabaseAdmin.from("Papers").update(updates).eq("id", id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) {
+    console.error("DB update failed:", e);
+    res.status(500).json({ error: "Failed to update paper" });
+  }
+});
+
+app.post("/api/papers", requireAdmin, requireRole(["super_admin", "content_admin"]), async (req, res) => {
+  try {
+    const payload = req.body;
+    const { data, error } = await supabaseAdmin.from("Papers").insert([payload]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e: any) {
+    console.error("DB insert failed:", e);
+    res.status(500).json({ error: e.message || "Failed to create paper" });
   }
 });
 
@@ -883,7 +1126,7 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
   try {
     const { data: order, error: orderErr } = await supabaseAdmin
       .from("Orders")
-      .select("id, status, paper_id")
+      .select("id, status, paper_id, customers (second_name)")
       .eq("id", orderId)
       .maybeSingle();
 
@@ -893,6 +1136,14 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
 
     if (order.status !== 'paid') {
       return res.status(403).json({ success: false, error: "Payment not verified. Access denied." });
+    }
+
+    // Ensure we have the second name to act as a password
+    const customerData: any = Array.isArray(order.customers) ? order.customers[0] : order.customers;
+    const secondName = customerData?.second_name?.trim();
+    
+    if (!secondName) {
+      return res.status(400).json({ success: false, error: "Missing customer second name for password protection." });
     }
 
     const { data: paper, error: paperErr } = await supabaseAdmin
@@ -905,6 +1156,7 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
       return res.status(404).json({ success: false, error: "Paper file not found in repository." });
     }
 
+    // Attempt to record the download
     try {
       const { error: insertErr } = await supabaseAdmin
         .from("downloads")
@@ -914,7 +1166,6 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
           downloaded_at: new Date().toISOString()
         });
       
-      // We purposefully ignore unique_violation errors (code '23505') to allow re-downloads
       if (insertErr && insertErr.code !== '23505') {
         console.warn("Notice: downloads record creation issue:", insertErr);
       }
@@ -922,29 +1173,38 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
       console.warn("Notice: downloads record exception:", dlErr);
     }
 
-    const { data: signedData, error: signErr } = await supabaseAdmin
+    // Download the raw PDF bytes securely on the backend
+    const { data: fileData, error: downloadErr } = await supabaseAdmin
       .storage
       .from("Papers")
-      .createSignedUrl(paper.file_path, 60);
+      .download(paper.file_path);
 
-    if (signErr || !signedData?.signedUrl) {
-      console.error("Error generating signed download URL:", signErr);
-      return res.status(500).json({ success: false, error: "Failed to generate secure download link." });
+    if (downloadErr || !fileData) {
+      console.error("Error downloading PDF from Storage:", downloadErr);
+      return res.status(500).json({ success: false, error: "Failed to retrieve the document." });
     }
 
-    return res.json({
-      success: true,
-      downloadUrl: signedData.signedUrl,
-      paper_title: paper.paper_title,
-      unit_code: paper.unit_code
-    });
+    // Convert Blob/File to Uint8Array and encrypt
+    const arrayBuffer = await fileData.arrayBuffer();
+    const pdfUint8 = new Uint8Array(arrayBuffer);
+    
+    // Encrypt in-memory using the customer's second name as the user password
+    const encryptedBytes = await encryptPDF(pdfUint8, secondName, { algorithm: 'RC4' });
+    
+    const outputFilename = `${paper.unit_code}_Exam.pdf`;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+    
+    return res.send(Buffer.from(encryptedBytes));
+
   } catch (err: any) {
-    console.error("Error generating order download:", err);
+    console.error("Error generating protected order download:", err);
     return res.status(500).json({ success: false, error: "Internal server error" });
   }
 });
 
-app.get("/api/transactions", async (req, res) => {
+app.get("/api/transactions", requireAdmin, requireRole(["super_admin", "finance_admin"]), async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from('payments')
@@ -979,32 +1239,32 @@ app.get("/api/transactions", async (req, res) => {
   }
 });
 
-app.post("/api/transactions", async (req, res) => {
+app.post("/api/transactions", requireAdmin, requireRole(["super_admin", "finance_admin"]), async (req, res) => {
   res.status(403).json({ error: "Forbidden. Use secure M-Pesa STK push flow." });
 });
 
-app.delete("/api/transactions/:id", async (req, res) => {
+app.delete("/api/transactions/:id", requireAdmin, requireRole(["super_admin", "finance_admin"]), async (req, res) => {
   res.status(403).json({ error: "Forbidden. Cannot delete transaction records." });
 });
 
-app.get("/api/messages", async (req, res) => {
+app.get("/api/messages", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.json([]);
 });
 
-app.post("/api/messages", async (req, res) => {
+app.post("/api/messages", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.status(501).json({ error: "Messages not yet implemented in Supabase" });
 });
 
-app.patch("/api/messages/:id", async (req, res) => {
+app.patch("/api/messages/:id", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.status(501).json({ error: "Messages not yet implemented in Supabase" });
 });
 
-app.delete("/api/messages/:id", async (req, res) => {
+app.delete("/api/messages/:id", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.status(501).json({ error: "Messages not yet implemented in Supabase" });
 });
 
 // Admin Live Stats Endpoint
-app.get("/api/admin/stats", async (req, res) => {
+app.get("/api/admin/stats", requireAdmin, async (req, res) => {
   try {
     const [{ count: totalPapers }, { count: activePapers }, { count: totalDownloads }, { data: payments }] = await Promise.all([
       supabaseAdmin.from('Papers').select('*', { count: 'exact', head: true }),
@@ -1031,19 +1291,19 @@ app.get("/api/admin/stats", async (req, res) => {
 });
 
 // Affiliate Program Endpoints
-app.get("/api/affiliates", async (req, res) => {
+app.get("/api/affiliates", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.json([]);
 });
 
-app.post("/api/affiliates", async (req, res) => {
+app.post("/api/affiliates", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.status(501).json({ error: "Affiliates not yet implemented in Supabase" });
 });
 
-app.patch("/api/affiliates/:id", async (req, res) => {
+app.patch("/api/affiliates/:id", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.status(501).json({ error: "Affiliates not yet implemented in Supabase" });
 });
 
-app.delete("/api/affiliates/:id", async (req, res) => {
+app.delete("/api/affiliates/:id", requireAdmin, requireRole(["super_admin", "support_admin"]), async (req, res) => {
   res.status(501).json({ error: "Affiliates not yet implemented in Supabase" });
 });
 

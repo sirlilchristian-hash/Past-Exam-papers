@@ -1,3 +1,4 @@
+import { AdminManagementTab } from './AdminManagementTab';
 import React, { useState, useRef, useEffect } from 'react';
 import {
   ShieldAlert,
@@ -106,11 +107,58 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 }) => {
   // Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
-  const [adminPin, setAdminPin] = useState<string>('');
+  const [adminRole, setAdminRole] = useState<string>('');
+
+  useEffect(() => {
+    const token = localStorage.getItem('admin_token');
+    if (token) {
+      setIsAuthenticated(true);
+      setAdminRole(localStorage.getItem('admin_role') || '');
+    }
+  }, []);
+
+  
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [cpCurrent, setCpCurrent] = useState('');
+  const [cpNew, setCpNew] = useState('');
+  const [cpMsg, setCpMsg] = useState('');
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const res = await fetch('/api/admin/change-password', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('admin_token')}`
+        },
+        body: JSON.stringify({ currentPassword: cpCurrent, newPassword: cpNew })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setCpMsg('Password changed successfully.');
+        setCpCurrent('');
+        setCpNew('');
+      } else {
+        setCpMsg(data.error || 'Failed to change password.');
+      }
+    } catch (err) {
+      setCpMsg('Network error.');
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('admin_token');
+    localStorage.removeItem('admin_role');
+    setAdminRole('');
+    setIsAuthenticated(false);
+  };
+  const [accountId, setAccountId] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
   const [loginError, setLoginError] = useState<string>('');
 
   // Active Admin Tab
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'papers' | 'transactions' | 'messages' | 'affiliates' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'papers' | 'transactions' | 'messages' | 'affiliates' | 'settings' | 'admins'>('dashboard');
 
   // Database State
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
@@ -121,7 +169,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   useEffect(() => {
     if (isAuthenticated) {
-      fetch('/api/transactions')
+      fetch('/api/transactions', { headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` } })
         .then(res => res.json())
         .then(data => {
           if (Array.isArray(data) && data.length > 0) {
@@ -130,7 +178,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         })
         .catch(err => console.error(err));
 
-      fetch('/api/messages')
+      fetch('/api/messages', { headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` } })
         .then(res => res.json())
         .then(data => {
           if (Array.isArray(data) && data.length > 0) {
@@ -139,7 +187,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         })
         .catch(err => console.error(err));
 
-      fetch('/api/affiliates')
+      fetch('/api/affiliates', { headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` } })
         .then(res => res.json())
         .then(data => {
           if (Array.isArray(data) && data.length > 0) {
@@ -174,7 +222,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     try {
       await fetch(`/api/affiliates/${id}`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('admin_token')}`
+        },
         body: JSON.stringify({ status: newStatus }),
       });
       setAffiliates(prev =>
@@ -188,7 +239,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const handleDeleteAffiliate = async (id: string) => {
     if (!window.confirm('Are you sure you want to remove this affiliate submission?')) return;
     try {
-      await fetch(`/api/affiliates/${id}`, { method: 'DELETE' });
+      await fetch(`/api/affiliates/${id}`, { 
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` }
+      });
       setAffiliates(prev => prev.filter(a => a.id !== id && a.referralCode !== id));
     } catch (e) {
       console.error('Error deleting affiliate:', e);
@@ -328,7 +382,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   useEffect(() => {
     if (!isOpen) {
       setIsAuthenticated(false);
-      setAdminPin('');
+      setAccountId(''); setPassword('');
       setLoginError('');
       setActiveTab('dashboard');
     }
@@ -423,14 +477,27 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     }
   };
 
-  const handleLoginSubmit = (e: React.FormEvent) => {
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (adminPin === currentAdminPin || adminPin === 'admin') {
-      setIsAuthenticated(true);
-      setLoginError('');
-      setAdminPin('');
-    } else {
-      setLoginError('Incorrect Admin PIN. (Default PIN is 1234)');
+    try {
+      const res = await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountId, password })
+      });
+      const data = await res.json();
+      if (res.ok && data.success && data.token) {
+        localStorage.setItem('admin_token', data.token);
+        localStorage.setItem('admin_role', data.role);
+        setAdminRole(data.role);
+        setIsAuthenticated(true);
+        setLoginError('');
+        setAccountId('');
+      } else {
+        setLoginError(data.error || 'Incorrect Admin PIN');
+      }
+    } catch (err) {
+      setLoginError('Network error connecting to backend.');
     }
   };
 
@@ -536,6 +603,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     try {
       const res = await fetch('/api/papers/upload', {
         method: 'POST',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` },
         body: formData, // Browser sets multipart boundary header automatically
       });
 
@@ -694,6 +762,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           formData.append('file', bulkTasks[i].file);
           const res = await fetch('/api/digitize-paper', {
             method: 'POST',
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` },
             body: formData,
           });
 
@@ -867,43 +936,51 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
             <div className="space-y-1.5">
               <h3 className="text-2xl font-black text-white">Administrator Login</h3>
               <p className="text-xs text-slate-400">
-                Enter your secure Admin PIN to access backend database logs and controls.
+                Enter your secure credentials to access backend database logs and controls.
               </p>
             </div>
 
             <form onSubmit={handleLoginSubmit} className="space-y-4 text-left">
               <div>
                 <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">
-                  Admin PIN
+                  Account ID
+                </label>
+                <input
+                  type="text"
+                  value={accountId}
+                  onChange={(e) => {
+                    setAccountId(e.target.value);
+                    if (loginError) setLoginError('');
+                  }}
+                  placeholder="Enter Account ID"
+                  className="w-full px-4 py-3 bg-slate-950 rounded-xl border border-slate-800 focus:border-[#00D26A] focus:ring-1 focus:ring-[#00D26A] text-white text-center tracking-widest text-lg outline-none"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">
+                  Password
                 </label>
                 <input
                   type="password"
-                  value={adminPin ?? ''}
+                  value={password}
                   onChange={(e) => {
-                    setAdminPin(e.target.value);
+                    setPassword(e.target.value);
                     if (loginError) setLoginError('');
                   }}
-                  placeholder="Enter PIN (Default: 1234)"
+                  placeholder="Enter secure password"
                   className="w-full px-4 py-3 bg-slate-950 rounded-xl border border-slate-800 focus:border-[#00D26A] focus:ring-1 focus:ring-[#00D26A] text-white text-center tracking-widest text-lg outline-none"
-                  autoFocus
                 />
                 {loginError && (
                   <p className="text-xs text-rose-500 font-semibold mt-2">{loginError}</p>
                 )}
               </div>
-
               <button
                 type="submit"
-                className="w-full py-3.5 bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 font-black rounded-xl transition-all shadow-lg shadow-[#00D26A]/10 text-sm"
+                className="w-full bg-[#00D26A] hover:bg-[#00b55b] text-slate-950 font-bold py-3 rounded-xl transition-colors mt-2"
               >
-                Unlock Admin Console
+                Authenticate
               </button>
-
-              <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-center">
-                <p className="text-[11px] text-slate-400">
-                  💡 <strong className="text-slate-200">Tip:</strong> Access triggered via secret footer dot connector. Default PIN: <strong className="text-[#00D26A]">1234</strong>
-                </p>
-              </div>
             </form>
           </div>
         ) : (
@@ -997,17 +1074,57 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 <Settings className="w-4 h-4" />
                 <span>Settings</span>
               </button>
+              {adminRole === 'super_admin' && (
+                <button
+                  onClick={() => setActiveTab('admins')}
+                  className={`px-4 py-2 text-sm font-bold rounded-lg transition-colors ${
+                    activeTab === 'admins'
+                      ? 'bg-[#00D26A]/20 text-[#00D26A]'
+                      : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+                  }`}
+                >
+                  Admin Management
+                </button>
+              )}
 
               <button
-                onClick={() => setIsAuthenticated(false)}
-                className="ml-auto px-3 py-1.5 text-xs text-rose-400 hover:text-rose-300 font-bold flex items-center gap-1 shrink-0"
+                onClick={() => setShowChangePassword(true)}
+                className="ml-auto px-3 py-1.5 text-xs text-slate-400 hover:text-white font-bold flex items-center gap-1 shrink-0"
+              >
+                Change Password
+              </button>
+              <button
+                onClick={handleLogout}
+                className="ml-3 px-3 py-1.5 text-xs text-rose-400 hover:text-rose-300 font-bold flex items-center gap-1 shrink-0"
               >
                 <LogOut className="w-3.5 h-3.5" />
                 <span>Lock</span>
               </button>
             </div>
 
+            
+            {showChangePassword && (
+              <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm p-6 relative">
+                  <button onClick={() => setShowChangePassword(false)} className="absolute top-4 right-4 text-slate-400 hover:text-white">X</button>
+                  <h3 className="text-xl font-bold text-white mb-4">Change Password</h3>
+                  <form onSubmit={handleChangePassword} className="space-y-4">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">Current Password</label>
+                      <input type="password" value={cpCurrent} onChange={e => setCpCurrent(e.target.value)} className="w-full px-4 py-2 bg-slate-950 rounded-lg border border-slate-800 focus:border-[#00D26A] text-white" required />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">New Password</label>
+                      <input type="password" value={cpNew} onChange={e => setCpNew(e.target.value)} minLength={8} className="w-full px-4 py-2 bg-slate-950 rounded-lg border border-slate-800 focus:border-[#00D26A] text-white" required />
+                    </div>
+                    <button type="submit" className="w-full bg-[#00D26A] hover:bg-[#00b55b] text-slate-950 font-bold py-2 rounded-lg">Update Password</button>
+                    {cpMsg && <p className="text-sm mt-2 text-center text-[#00D26A]">{cpMsg}</p>}
+                  </form>
+                </div>
+              </div>
+            )}
             {/* Dashboard Scrollable Body */}
+
             <div className="p-6 overflow-y-auto flex-1 space-y-6">
               {/* TAB 1: OVERVIEW */}
               {activeTab === 'dashboard' && (
@@ -2252,6 +2369,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                     <CheckCircle2 className="w-4 h-4 text-[#00D26A] absolute right-3 top-3" />
                   )}
                 </div>
+              {activeTab === 'admins' && adminRole === 'super_admin' && (
+                <AdminManagementTab />
+              )}
+
                 {(formTouched.unit_code || hasAttemptedSubmit) && formErrors.unit_code && (
                   <p className="text-[11px] text-rose-400 font-semibold mt-1 flex items-center gap-1">
                     <AlertCircle className="w-3 h-3 shrink-0" />
