@@ -336,7 +336,7 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
   try {
     const paperId = req.body?.paperId?.trim();
     const unitCode = (req.body?.unit_code || req.body?.unitCode || '').trim().toUpperCase();
-    const paperTitle = (req.body?.paper_title || req.body?.unitName || '').trim();
+    const paperTitle = (req.body?.paper_title || req.body?.unitName || req.body?.paperTitle || '').trim();
     const rawPrice = (req.body?.price || '').toString().trim();
     const status = (req.body?.status || 'available').trim().toLowerCase();
 
@@ -676,8 +676,18 @@ app.post("/api/admin/papers/:id/testdownload", async (req, res) => {
     const pdfUint8 = new Uint8Array(arrayBuffer);
     console.log("File loaded to Uint8Array. Size:", pdfUint8.length);
     
-    const encryptedBytes = await encryptPDF(pdfUint8, password, { algorithm: 'RC4' });
-    console.log("File encrypted. Size:", encryptedBytes.length);
+    let encryptedBytes;
+    try {
+      encryptedBytes = await encryptPDF(pdfUint8, password, { algorithm: 'RC4' });
+      console.log("File encrypted. Size:", encryptedBytes.length);
+    } catch (encryptErr: any) {
+      if (encryptErr.code === 'ALREADY_ENCRYPTED' || encryptErr.message?.includes('already password-protected') || encryptErr.message?.includes('Cannot read properties of undefined (reading \'Pages\')') || encryptErr.message?.includes('Pages')) {
+        console.log("File is already encrypted or cannot be parsed for encryption, skipping encryption");
+        encryptedBytes = pdfUint8;
+      } else {
+        throw encryptErr;
+      }
+    }
     
     const outputFilename = `${paper.unit_code}_Exam.pdf`;
     res.setHeader('Content-Type', 'application/pdf');
@@ -729,8 +739,18 @@ app.post("/api/admin/papers/:id/download", requireAdmin, requireRole(["super_adm
     const pdfUint8 = new Uint8Array(arrayBuffer);
     console.log("File loaded to Uint8Array. Size:", pdfUint8.length);
     
-    const encryptedBytes = await encryptPDF(pdfUint8, password, { algorithm: 'RC4' });
-    console.log("File encrypted. Size:", encryptedBytes.length);
+    let encryptedBytes;
+    try {
+      encryptedBytes = await encryptPDF(pdfUint8, password, { algorithm: 'RC4' });
+      console.log("File encrypted. Size:", encryptedBytes.length);
+    } catch (encryptErr: any) {
+      if (encryptErr.code === 'ALREADY_ENCRYPTED' || encryptErr.message?.includes('already password-protected') || encryptErr.message?.includes('Cannot read properties of undefined (reading \'Pages\')') || encryptErr.message?.includes('Pages')) {
+        console.log("File is already encrypted or cannot be parsed for encryption, skipping encryption");
+        encryptedBytes = pdfUint8;
+      } else {
+        throw encryptErr;
+      }
+    }
     
     const outputFilename = `${paper.unit_code}_Exam.pdf`;
     res.setHeader('Content-Type', 'application/pdf');
@@ -1367,7 +1387,17 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
     const pdfUint8 = new Uint8Array(arrayBuffer);
     
     // Encrypt in-memory using the customer's second name as the user password
-    const encryptedBytes = await encryptPDF(pdfUint8, secondName, { algorithm: 'RC4' });
+    let encryptedBytes;
+    try {
+      encryptedBytes = await encryptPDF(pdfUint8, secondName, { algorithm: 'RC4' });
+    } catch (encryptErr: any) {
+      if (encryptErr.code === 'ALREADY_ENCRYPTED' || encryptErr.message?.includes('already password-protected') || encryptErr.message?.includes('Cannot read properties of undefined (reading \'Pages\')') || encryptErr.message?.includes('Pages')) {
+        console.log("File is already encrypted or cannot be parsed for encryption, skipping encryption");
+        encryptedBytes = pdfUint8;
+      } else {
+        throw encryptErr;
+      }
+    }
     
     const outputFilename = `${paper.unit_code}_Exam.pdf`;
 
