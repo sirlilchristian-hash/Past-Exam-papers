@@ -145,7 +145,22 @@ export const ActivationResultModal: React.FC<ActivationResultModalProps> = ({
                   href={data.openDocumentUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
+                  onClick={(e) => {
+                    // In sandboxed iframes or popup-restricted web previews, a pure target="_blank"
+                    // anchor click may be blocked by iframe sandboxing. Fallback to window.open or top-level navigation.
+                    if (data.openDocumentUrl) {
+                      try {
+                        const opened = window.open(data.openDocumentUrl, '_blank', 'noopener,noreferrer');
+                        if (!opened) {
+                          // If popup blocked or iframe restricted, direct navigation fallback
+                          window.location.assign(data.openDocumentUrl);
+                        }
+                      } catch {
+                        // ignore and allow standard anchor navigation
+                      }
+                    }
+                  }}
+                  className="py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
                 >
                   <ExternalLink className="w-3.5 h-3.5" />
                   <span>Test Open</span>
