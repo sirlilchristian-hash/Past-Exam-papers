@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   Mail,
   GraduationCap,
-  Download,
   Sprout,
   Menu,
   X,
@@ -12,10 +11,11 @@ import {
   Info,
   Users,
   ChevronRight,
+  FileText,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
-export type NavTab = 'home' | 'search' | 'how-it-works' | 'about' | 'contact' | 'affiliate';
+export type NavTab = 'home' | 'search' | 'view-document' | 'how-it-works' | 'about' | 'contact' | 'affiliate';
 
 interface HeaderProps {
   activeTab?: NavTab;
@@ -26,7 +26,8 @@ interface HeaderProps {
 
 const NAV_ITEMS: { id: NavTab; label: string; icon: React.ElementType }[] = [
   { id: 'home', label: 'Home', icon: Home },
-  { id: 'search', label: 'Search', icon: Search },
+  { id: 'search', label: 'Search Documents', icon: Search },
+  { id: 'view-document', label: 'View Your Document', icon: FileText },
   { id: 'how-it-works', label: 'How It Works', icon: HelpCircle },
   { id: 'about', label: 'About', icon: Info },
   { id: 'contact', label: 'Contact', icon: Mail },
@@ -131,7 +132,7 @@ const MobileNavigation: React.FC<{
           >
             <div className="flex items-center justify-between text-[11px] font-bold text-[#8BB99E] uppercase tracking-wider px-1">
               <span>All Navigation Tabs</span>
-              <span className="text-[#00D26A]">6 Tabs</span>
+              <span className="text-[#00D26A]">{NAV_ITEMS.length} Tabs</span>
             </div>
 
             {/* Grid of all 6 tabs in mobile view */}
@@ -186,7 +187,7 @@ const MobileNavigation: React.FC<{
                 }}
                 className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 text-xs font-bold transition-colors"
               >
-                <Download className="w-3.5 h-3.5 stroke-[2.5]" />
+                <Search className="w-3.5 h-3.5 stroke-[2.5]" />
                 <span>Search Papers</span>
               </button>
             </div>
@@ -250,16 +251,18 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </div>
 
-          {/* Download Button (Available across all devices) */}
+          {/* View Your Document Button */}
           <button
-            onClick={() => {
-              handleTabClick('search');
-              onDownloadClick?.();
-            }}
-            className="flex items-center gap-1.5 sm:gap-2 px-3 sm:px-5 py-2 sm:py-2.5 rounded-full bg-[#00D26A] hover:bg-[#00b85c] text-slate-950 font-extrabold text-xs sm:text-sm shadow-md shadow-[#00D26A]/20 transition-all duration-200 active:scale-95 cursor-pointer shrink-0"
+            onClick={() => handleTabClick('view-document')}
+            className={`flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-2 sm:py-2.5 rounded-full border text-xs sm:text-sm font-bold transition-all duration-200 active:scale-95 cursor-pointer shrink-0 ${
+              activeTab === 'view-document'
+                ? 'bg-[#00D26A] text-slate-950 border-[#00D26A]'
+                : 'border-[#00D26A]/60 text-white hover:bg-[#00D26A]/10'
+            }`}
           >
-            <Download className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-950 stroke-[2.5]" />
-            <span>Download</span>
+            <FileText className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#00D26A]" />
+            <span className="hidden sm:inline">View Your Document</span>
+            <span className="sm:hidden">View Doc</span>
           </button>
 
           {/* Desktop-Only: Contact Us Button */}

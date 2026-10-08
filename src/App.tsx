@@ -10,6 +10,7 @@ import { HowItWorksPage } from './components/HowItWorksPage';
 import { AboutPage } from './components/AboutPage';
 import { AffiliatePage } from './components/AffiliatePage';
 import { SearchPaperWorkflow } from './components/SearchPaperWorkflow';
+import { ViewYourDocumentView } from './components/ViewYourDocumentView';
 import { AdminPortal } from './components/AdminPortal';
 import { Paper } from './types';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -27,10 +28,44 @@ function AppContent() {
   const formRef = useRef<HTMLDivElement>(null);
   const [activeTab, setActiveTab] = useState<NavTab>('home');
   const [unitQuery, setUnitQuery] = useState<string>('');
-  const [isAdminOpen, setIsAdminOpen] = useState<boolean>(false);
+  const [isAdminOpen, setIsAdminOpen] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const path = window.location.pathname;
+      return path === '/admin' || path.startsWith('/admin/');
+    }
+    return false;
+  });
   const [papers, setPapers] = useState<Paper[]>([]);
   const [isLoadingPapers, setIsLoadingPapers] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Synchronize browser history /admin path with isAdminOpen state
+  useEffect(() => {
+    const handleLocationChange = () => {
+      const path = window.location.pathname;
+      if (path === '/admin' || path.startsWith('/admin/')) {
+        setIsAdminOpen(true);
+      } else if (path === '/') {
+        setIsAdminOpen(false);
+      }
+    };
+    window.addEventListener('popstate', handleLocationChange);
+    return () => window.removeEventListener('popstate', handleLocationChange);
+  }, []);
+
+  const handleOpenAdmin = () => {
+    setIsAdminOpen(true);
+    if (!window.location.pathname.startsWith('/admin')) {
+      window.history.pushState({}, '', '/admin');
+    }
+  };
+
+  const handleCloseAdmin = () => {
+    setIsAdminOpen(false);
+    if (window.location.pathname.startsWith('/admin')) {
+      window.history.pushState({}, '', '/');
+    }
+  };
 
   const loadPapers = useCallback(async () => {
     try {
@@ -241,6 +276,23 @@ function AppContent() {
                 />
               </div>
             </motion.div>
+          ) : activeTab === 'view-document' ? (
+            <motion.div
+              key="view-document"
+              variants={pageVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              transition={pageTransition}
+              className="max-w-xl mx-auto w-full py-4 space-y-6"
+            >
+              <div ref={formRef} className="w-full">
+                <ViewYourDocumentView
+                  onBackToHome={() => handleSelectTab('home')}
+                  onSearchClick={() => handleSelectTab('search')}
+                />
+              </div>
+            </motion.div>
           ) : (
             <motion.div
               key="home"
@@ -264,7 +316,7 @@ function AppContent() {
       {/* Footer Branding */}
       <Footer
         onOpenLegal={handleOpenLegal}
-        onOpenAdmin={() => setIsAdminOpen(true)}
+        onOpenAdmin={handleOpenAdmin}
         onOpenAffiliate={() => handleSelectTab('affiliate')}
       />
 
@@ -275,10 +327,10 @@ function AppContent() {
         onClose={() => setLegalModal((prev) => ({ ...prev, isOpen: false }))}
       />
 
-      {/* Secret Admin Portal triggered via dot in Footer */}
+      {/* Protected Admin Portal with Mandatory Authentication */}
       <AdminPortal
         isOpen={isAdminOpen}
-        onClose={() => setIsAdminOpen(false)}
+        onClose={handleCloseAdmin}
         papers={papers}
         setPapers={setPapers}
         isLoadingPapers={isLoadingPapers}

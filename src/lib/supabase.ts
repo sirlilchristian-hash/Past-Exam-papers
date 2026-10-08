@@ -124,17 +124,28 @@ export async function updatePaperUnified(
  */
 export async function deletePaperUnified(
   id: string
-): Promise<{ success: boolean; error: string | null }> {
+): Promise<{ success: boolean; message?: string; error: string | null }> {
   try {
-    const res = await fetch(`/api/papers/${id}`, { 
+    const token = localStorage.getItem('admin_token');
+    const res = await fetch(`/api/papers/${encodeURIComponent(id)}`, { 
       method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${localStorage.getItem('admin_token')}` }
+      headers: { 
+        'Authorization': `Bearer ${token}` 
+      }
     });
+
+    const data = await res.json().catch(() => null);
+
     if (!res.ok) {
-      return { success: false, error: 'Failed to delete paper' };
+      const errorMsg = data?.error || (res.status === 404 ? 'Document not found.' : 'Failed to delete paper');
+      return { success: false, error: errorMsg };
     }
 
-    return { success: true, error: null };
+    return { 
+      success: true, 
+      message: data?.message || 'Document deleted successfully.', 
+      error: null 
+    };
   } catch (err: any) {
     return { success: false, error: err?.message || 'Network error deleting paper' };
   }

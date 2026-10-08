@@ -16,6 +16,7 @@ export interface Paper {
   downloadsCount?: number;
   docId?: string;
   digitizedContent?: any;
+  localFile?: File | null;
 }
 
 export type ExamPaperAdminItem = Paper;
