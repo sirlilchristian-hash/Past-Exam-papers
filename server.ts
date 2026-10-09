@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import jwt from "jsonwebtoken";
@@ -18,6 +19,43 @@ import crypto from 'crypto';
 
 // In-memory cache for order email delivery status
 const orderEmailStatusMap = new Map<string, { status: 'EMAIL SENT' | 'EMAIL FAILED' | 'EMAIL NOT CONFIGURED'; sentAt?: string; error?: string }>();
+
+// Persistent / In-memory mapping of orderId & checkoutRequestId to customer email
+const ORDER_EMAILS_FILE = path.join(process.cwd(), '.order_emails.json');
+
+function loadOrderEmails(): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    if (fs.existsSync(ORDER_EMAILS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ORDER_EMAILS_FILE, 'utf-8'));
+      for (const [k, v] of Object.entries(data)) {
+        if (typeof v === 'string') map.set(k, v);
+      }
+    }
+  } catch (e) {
+    console.warn('[ORDER_EMAIL] Error loading cached emails:', e);
+  }
+  return map;
+}
+
+const orderEmailRegistry = loadOrderEmails();
+
+function saveOrderEmail(key: string, email: string) {
+  if (!key || !email) return;
+  orderEmailRegistry.set(key, email);
+  try {
+    const obj: Record<string, string> = {};
+    orderEmailRegistry.forEach((v, k) => { obj[k] = v; });
+    fs.writeFileSync(ORDER_EMAILS_FILE, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[ORDER_EMAIL] Error persisting email registry:', e);
+  }
+}
+
+function getOrderEmail(key?: string): string | undefined {
+  if (!key) return undefined;
+  return orderEmailRegistry.get(key);
+}
 
 
 const ENCRYPTION_KEY = process.env.JWT_SECRET ? crypto.createHash('sha256').update(process.env.JWT_SECRET).digest('base64').substring(0, 32) : crypto.createHash('sha256').update('fallback-secret-32-chars-long-abc').digest('base64').substring(0, 32);
@@ -1386,7 +1424,40 @@ app.post("/api/orders/whatsapp", async (req, res) => {
 });
 
 app.post("/api/mpesa/stkpush", async (req, res) => {
-  // 0. Check Server M-Pesa Daraja Credentials early to avoid DB writes if missing
+  const { paper_id, paperId, first_name, firstName, studentFirstName, second_name, secondName, studentSecondName, phone, email, studentEmail } = req.body;
+
+  const targetPaperId = paper_id || paperId;
+  const targetFirstName = (first_name || firstName || studentFirstName || '').trim();
+  const targetSecondName = (second_name || secondName || studentSecondName || '').trim();
+  const targetEmail = (email || studentEmail || '').trim().toLowerCase();
+
+  // 1. Validate required fields
+  if (!targetPaperId) {
+    return res.status(400).json({ success: false, error: "Paper ID is required." });
+  }
+  if (!targetFirstName || !targetSecondName) {
+    return res.status(400).json({ success: false, error: "First name and second name are required." });
+  }
+
+  // Validate email address on backend
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!targetEmail || !emailRegex.test(targetEmail)) {
+    return res.status(400).json({
+      success: false,
+      error: "Please enter a valid email address format (e.g. name@example.com)."
+    });
+  }
+
+  // 2. Validate and normalize phone number
+  const normalizedPhone = normalizeKenyanPhone(phone);
+  if (!normalizedPhone) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid Kenyan mobile phone number. Please enter a valid number (e.g. 0712345678 or 0112345678)."
+    });
+  }
+
+  // 3. Check Server M-Pesa Daraja Credentials early to avoid DB writes if missing
   const consumerKey = process.env.MPESA_CONSUMER_KEY;
   const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
   const mpesaEnv = (process.env.MPESA_ENV || 'sandbox').toLowerCase();
@@ -1404,29 +1475,6 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "M-Pesa configuration is incomplete. Missing required credentials for the active environment."
-    });
-  }
-
-  const { paper_id, paperId, first_name, firstName, studentFirstName, second_name, secondName, studentSecondName, phone } = req.body;
-
-  const targetPaperId = paper_id || paperId;
-  const targetFirstName = (first_name || firstName || studentFirstName || '').trim();
-  const targetSecondName = (second_name || secondName || studentSecondName || '').trim();
-
-  // 1. Validate required fields
-  if (!targetPaperId) {
-    return res.status(400).json({ success: false, error: "Paper ID is required." });
-  }
-  if (!targetFirstName || !targetSecondName) {
-    return res.status(400).json({ success: false, error: "First name and second name are required." });
-  }
-
-  // 2. Validate and normalize phone number
-  const normalizedPhone = normalizeKenyanPhone(phone);
-  if (!normalizedPhone) {
-    return res.status(400).json({
-      success: false,
-      error: "Invalid Kenyan mobile phone number. Please enter a valid number (e.g. 0712345678 or 0112345678)."
     });
   }
 
@@ -1452,8 +1500,9 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
     }
 
     // 4. Customer management: Find or create customer record in public.customers
+    // IMPORTANT: customers.phone stores ONLY the normalized phone number, never the email.
     let customerId: string | null = null;
-    const { data: existingCustomer, error: custSearchErr } = await supabaseAdmin
+    const { data: existingCustomer } = await supabaseAdmin
       .from("customers")
       .select("id")
       .eq("phone", normalizedPhone)
@@ -1461,27 +1510,55 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
 
     if (existingCustomer?.id) {
       customerId = existingCustomer.id;
-      // Update first and second name if updated
-      await supabaseAdmin
-        .from("customers")
-        .update({ first_name: targetFirstName, second_name: targetSecondName })
-        .eq("id", customerId);
-    } else {
-      const { data: newCustomer, error: createCustErr } = await supabaseAdmin
-        .from("customers")
-        .insert({
-          first_name: targetFirstName,
-          second_name: targetSecondName,
-          phone: normalizedPhone
-        })
-        .select("id")
-        .single();
-
-      if (createCustErr || !newCustomer) {
-        console.error("Customer creation error:", createCustErr);
-        return res.status(500).json({ success: false, error: "Failed to initialize customer record." });
+      // Update names, and try setting email if dedicated column exists in schema
+      try {
+        await supabaseAdmin
+          .from("customers")
+          .update({ first_name: targetFirstName, second_name: targetSecondName, email: targetEmail })
+          .eq("id", customerId);
+      } catch {
+        await supabaseAdmin
+          .from("customers")
+          .update({ first_name: targetFirstName, second_name: targetSecondName })
+          .eq("id", customerId);
       }
-      customerId = newCustomer.id;
+    } else {
+      // Try inserting with email first
+      try {
+        const { data: newCustWithEmail, error: custWithEmailErr } = await supabaseAdmin
+          .from("customers")
+          .insert({
+            first_name: targetFirstName,
+            second_name: targetSecondName,
+            phone: normalizedPhone,
+            email: targetEmail
+          })
+          .select("id")
+          .single();
+        if (!custWithEmailErr && newCustWithEmail) {
+          customerId = newCustWithEmail.id;
+        }
+      } catch {
+        // Fallback if column does not yet exist
+      }
+
+      if (!customerId) {
+        const { data: newCustomer, error: createCustErr } = await supabaseAdmin
+          .from("customers")
+          .insert({
+            first_name: targetFirstName,
+            second_name: targetSecondName,
+            phone: normalizedPhone
+          })
+          .select("id")
+          .single();
+
+        if (createCustErr || !newCustomer) {
+          console.error("Customer creation error:", createCustErr);
+          return res.status(500).json({ success: false, error: "Failed to initialize customer record." });
+        }
+        customerId = newCustomer.id;
+      }
     }
 
     // 5. Order Creation: Create pending order in public."Orders" using DB price (never browser price)
@@ -1501,6 +1578,9 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       return res.status(500).json({ success: false, error: "Failed to initialize order record." });
     }
     const orderId = newOrder.id;
+
+    // Securely associate customer email with orderId immediately
+    saveOrderEmail(orderId, targetEmail);
 
     // 6. Payment Creation: Create pending payment record in public.payments
     const { data: newPayment, error: paymentErr } = await supabaseAdmin
@@ -1558,14 +1638,19 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
     const passwordStr = `${shortcode}${passkey || ''}${timestamp}`;
     const password = Buffer.from(passwordStr).toString('base64');
 
+    // Support both Till Number (CustomerBuyGoodsOnline) and PayBill (CustomerPayBillOnline)
+    const isTill = Boolean(process.env.MPESA_TILL_NUMBER || process.env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline');
+    const transactionType = process.env.MPESA_TRANSACTION_TYPE || (isTill ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline');
+    const partyB = process.env.MPESA_PARTYB || process.env.MPESA_TILL_NUMBER || shortcode;
+
     const stkPayload = {
       BusinessShortCode: shortcode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: "CustomerPayBillOnline",
+      TransactionType: transactionType,
       Amount: Math.round(priceNumeric),
       PartyA: normalizedPhone,
-      PartyB: shortcode,
+      PartyB: partyB,
       PhoneNumber: normalizedPhone,
       CallBackURL: callbackUrl,
       AccountReference: dbPaper.unit_code || "ExamPaper",
@@ -1606,6 +1691,10 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
         })
         .eq("id", paymentId);
 
+      // Save order email mapping for both orderId and checkoutRequestId
+      saveOrderEmail(orderId, targetEmail);
+      saveOrderEmail(checkoutRequestId, targetEmail);
+
       return res.json({
         success: true,
         status: "pending",
@@ -1634,6 +1723,226 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       success: false,
       error: "Payment status is being confirmed. If you already received an M-Pesa prompt, do not retry the payment."
     });
+  }
+});
+
+// TEMPORARY: Isolated Administrator/Developer Payment Simulation Endpoint
+// Safely executes the exact downstream post-payment fulfillment architecture without touching real M-Pesa callback.
+app.post("/api/admin/simulate-successful-payment", async (req, res) => {
+  // 1. Guard check: Must be explicitly enabled via environment variable
+  const isSimulationEnabled = process.env.ENABLE_PAYMENT_SIMULATION === 'true';
+  if (!isSimulationEnabled) {
+    return res.status(403).json({
+      success: false,
+      error: "Payment simulation is disabled. Set ENABLE_PAYMENT_SIMULATION=true to enable."
+    });
+  }
+
+  // 2. Authentication check: Require valid Admin JWT OR dedicated SIMULATION_SECRET
+  const authHeader = req.headers.authorization || '';
+  const simulationSecretHeader = req.headers['x-simulation-secret'] || req.body?.simulationSecret;
+  const configuredSimSecret = process.env.SIMULATION_SECRET;
+
+  let isAuthorized = false;
+  if (authHeader.startsWith("Bearer ")) {
+    try {
+      const token = authHeader.split(" ")[1];
+      jwt.verify(token, JWT_SECRET);
+      isAuthorized = true;
+    } catch {
+      isAuthorized = false;
+    }
+  }
+
+  if (!isAuthorized && configuredSimSecret && simulationSecretHeader === configuredSimSecret) {
+    isAuthorized = true;
+  }
+
+  if (!isAuthorized) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized: Valid admin token or simulation secret required."
+    });
+  }
+
+  const { paper_id, paperId, first_name, firstName, studentFirstName, second_name, secondName, studentSecondName, phone, email, studentEmail } = req.body;
+
+  const targetPaperId = paper_id || paperId;
+  const targetFirstName = (first_name || firstName || studentFirstName || 'TestCustomer').trim();
+  const targetSecondName = (second_name || secondName || studentSecondName || 'Simulation').trim();
+  const targetEmail = (email || studentEmail || '').trim().toLowerCase();
+  const rawPhone = phone || '0712345678';
+  const normalizedPhone = normalizeKenyanPhone(rawPhone) || '254712345678';
+
+  if (!targetPaperId) {
+    return res.status(400).json({ success: false, error: "Paper ID is required for simulation." });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!targetEmail || !emailRegex.test(targetEmail)) {
+    return res.status(400).json({ success: false, error: "Valid recipient email address is required for simulation." });
+  }
+
+  try {
+    // Fetch authoritative paper details
+    const { data: dbPaper, error: paperErr } = await supabaseAdmin
+      .from("Papers")
+      .select("*")
+      .eq("id", targetPaperId)
+      .single();
+
+    if (paperErr || !dbPaper) {
+      return res.status(404).json({ success: false, error: "Paper not found in catalog." });
+    }
+
+    const priceNumeric = Number(dbPaper.price) || 50;
+
+    // Customer record creation or lookup
+    let customerId: string | null = null;
+    const { data: existingCustomer } = await supabaseAdmin
+      .from("customers")
+      .select("id")
+      .eq("phone", normalizedPhone)
+      .maybeSingle();
+
+    if (existingCustomer?.id) {
+      customerId = existingCustomer.id;
+    } else {
+      const { data: newCust, error: custErr } = await supabaseAdmin
+        .from("customers")
+        .insert({
+          first_name: targetFirstName,
+          second_name: targetSecondName,
+          phone: normalizedPhone
+        })
+        .select("id")
+        .single();
+      if (custErr || !newCust) {
+        return res.status(500).json({ success: false, error: "Failed to initialize customer for simulation." });
+      }
+      customerId = newCust.id;
+    }
+
+    // Create Order with pending status initially
+    const { data: newOrder, error: ordErr } = await supabaseAdmin
+      .from("Orders")
+      .insert({
+        customer_id: customerId,
+        paper_id: targetPaperId,
+        amount: priceNumeric,
+        status: 'pending'
+      })
+      .select("id")
+      .single();
+
+    if (ordErr || !newOrder) {
+      return res.status(500).json({ success: false, error: "Failed to initialize order." });
+    }
+    const orderId = newOrder.id;
+
+    // Associate email with order
+    saveOrderEmail(orderId, targetEmail);
+
+    // Generate unique simulation receipt and checkout IDs
+    const timestampPart = Date.now().toString(36).toUpperCase();
+    const simReceipt = `SIM${timestampPart}`;
+    const simCheckoutId = `ws_CO_SIM_${Date.now()}`;
+    const simMerchantId = `SIM_MERCHANT_${Date.now()}`;
+
+    // Create payment record
+    const { data: newPayment, error: payErr } = await supabaseAdmin
+      .from("payments")
+      .insert({
+        order_id: orderId,
+        phone: normalizedPhone,
+        amount: priceNumeric,
+        status: 'pending',
+        checkout_request_id: simCheckoutId,
+        merchant_request_id: simMerchantId
+      })
+      .select("id")
+      .single();
+
+    if (payErr || !newPayment) {
+      await supabaseAdmin.from("Orders").delete().eq("id", orderId);
+      return res.status(500).json({ success: false, error: "Failed to create payment tracking." });
+    }
+    const paymentId = newPayment.id;
+    saveOrderEmail(simCheckoutId, targetEmail);
+
+    // Transition payment to completed and order to paid
+    await supabaseAdmin
+      .from("payments")
+      .update({
+        status: 'completed',
+        mpesa_receipt: simReceipt,
+        amount: priceNumeric,
+        phone: normalizedPhone,
+        transaction_date: new Date().toISOString()
+      })
+      .eq("id", paymentId);
+
+    await supabaseAdmin
+      .from("Orders")
+      .update({ status: 'paid' })
+      .eq("id", orderId);
+
+    console.log(`[SIMULATION SUCCESS] Order ${orderId} & Payment ${paymentId} marked PAID/COMPLETED with receipt ${simReceipt}`);
+
+    // Generate PDF receipt asynchronously
+    generateAndMergeReceipt(orderId).catch(err => {
+      console.error("[SIMULATION RECEIPT ERROR]", err);
+    });
+
+    // Generate secure document access token
+    const accessToken = generateAccessToken(orderId);
+    const appUrl = (process.env.APP_URL || 'https://godrerypublishers.co.ke').replace(/\/+$/, '');
+    const openDocumentUrl = `${appUrl}/document/access/${accessToken}`;
+
+    // Trigger SMTP document activation email using existing Nodemailer email service
+    let emailStatus = 'pending';
+    let emailError: string | null = null;
+
+    try {
+      console.log(`[SIMULATION] Sending document activation email to: ${targetEmail}`);
+      const emailResult = await sendActivationEmail({
+        to: targetEmail,
+        firstName: targetFirstName,
+        paperTitle: dbPaper.paper_title || 'Purchased Document',
+        openDocumentUrl,
+      });
+
+      emailStatus = emailResult.status;
+      if (emailResult.error) {
+        emailError = emailResult.error;
+      }
+      orderEmailStatusMap.set(orderId, {
+        status: emailResult.status,
+        sentAt: new Date().toISOString(),
+        error: emailResult.error,
+      });
+      console.log(`[SIMULATION] Email result: ${emailStatus}`);
+    } catch (mailErr: any) {
+      emailStatus = 'failed';
+      emailError = mailErr?.message || 'Email delivery exception';
+      console.error(`[SIMULATION] Email error:`, mailErr);
+    }
+
+    return res.json({
+      success: true,
+      simulated: true,
+      orderId,
+      paymentId,
+      mpesaReceipt: simReceipt,
+      orderStatus: 'paid',
+      paymentStatus: 'completed',
+      emailSentTo: targetEmail,
+      emailStatus,
+      emailError
+    });
+  } catch (err: any) {
+    console.error("[SIMULATION ERROR] Execution failed:", err);
+    return res.status(500).json({ success: false, error: err?.message || "Simulation error." });
   }
 });
 
@@ -1803,11 +2112,65 @@ app.post("/api/mpesa/callback", async (req, res) => {
 
     console.log(`[M-Pesa Callback Success] Order ID ${dbOrder.id} & Payment ID ${dbPayment.id} successfully marked PAID/COMPLETED! Receipt: ${mpesaReceipt}, Amount: KSh ${callbackAmount}`);
 
-    // Proactively generate receipt
-    // We don't await or we catch errors so callback still returns 200
+    // 1. Proactively generate and merge official receipt PDF
     generateAndMergeReceipt(dbOrder.id).catch(err => {
-        console.error("[RECEIPT ERROR] M-Pesa callback generation failed:", err);
+      console.error("[RECEIPT ERROR] M-Pesa callback generation failed:", err);
     });
+
+    // 2. Generate secure document access token
+    const accessToken = generateAccessToken(dbOrder.id);
+    const appUrl = (process.env.APP_URL || 'https://godrerypublishers.co.ke').replace(/\/+$/, '');
+    const openDocumentUrl = `${appUrl}/document/access/${accessToken}`;
+
+    // 3. Resolve customer email and trigger automated document delivery email
+    (async () => {
+      try {
+        let paperTitle = 'Purchased Document';
+        if (dbOrder.paper_id) {
+          const { data: pData } = await supabaseAdmin
+            .from("Papers")
+            .select("paper_title, unit_code")
+            .eq("id", dbOrder.paper_id)
+            .maybeSingle();
+          if (pData?.paper_title) {
+            paperTitle = pData.paper_title;
+          }
+        }
+
+        const { data: custData } = await supabaseAdmin
+          .from("customers")
+          .select("*")
+          .eq("id", dbOrder.customer_id)
+          .maybeSingle();
+
+        const studentEmail = getOrderEmail(dbOrder.id) 
+          || getOrderEmail(checkoutRequestId) 
+          || (custData as any)?.email;
+
+        const studentFirstName = custData?.first_name || '';
+
+        if (studentEmail && studentEmail.includes('@')) {
+          console.log(`[M-Pesa Callback] Triggering automatic document delivery email to: ${studentEmail}`);
+          const emailResult = await sendActivationEmail({
+            to: studentEmail,
+            firstName: studentFirstName,
+            paperTitle,
+            openDocumentUrl,
+          });
+
+          console.log(`[M-Pesa Callback Email Result] Order ${dbOrder.id}: ${emailResult.status}`);
+          orderEmailStatusMap.set(dbOrder.id, {
+            status: emailResult.status,
+            sentAt: new Date().toISOString(),
+            error: emailResult.error,
+          });
+        } else {
+          console.warn(`[M-Pesa Callback Email Warning] No valid email found for order ${dbOrder.id}`);
+        }
+      } catch (emailAsyncErr) {
+        console.error(`[M-Pesa Callback Email Async Error] Order ${dbOrder.id}:`, emailAsyncErr);
+      }
+    })();
 
     return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
   } catch (err: any) {

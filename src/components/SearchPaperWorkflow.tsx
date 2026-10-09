@@ -513,16 +513,21 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
     }
   };
 
-  const handlePaySubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handlePaySubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     const errors: Record<string, string> = {};
 
     if (!firstName.trim()) errors.firstName = 'First name is required';
     if (!secondName.trim()) errors.secondName = 'Second name is required';
+    if (!email.trim()) {
+      errors.email = 'Email address is required';
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      errors.email = 'Enter a valid email address (e.g. student@example.com)';
+    }
     if (!phone.trim()) {
       errors.phone = 'Phone number is required';
     } else if (!/^(07|01|2547|2541|\+2547|\+2541)\d{8}$/.test(phone.replace(/\s+/g, ''))) {
-      errors.phone = 'Enter a valid M-Pesa phone number (e.g., 0712345678)';
+      errors.phone = 'Enter a valid M-Pesa phone number (e.g., 0712345678 or 0112345678)';
     }
 
     if (Object.keys(errors).length > 0) {
@@ -543,13 +548,14 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
           paper_id: selectedPaper.id,
           first_name: firstName.trim(),
           second_name: secondName.trim(),
+          email: email.trim(),
           phone: phone.trim(),
         }),
       });
 
       const data = await res.json();
       if (!res.ok || !data.success) {
-        setPaymentErrors({ phone: data.error || 'Failed to initiate M-Pesa STK push.' });
+        setPaymentErrors({ general: data.error || 'Failed to initiate M-Pesa STK push.' });
         setIsInitiatingPayment(false);
         return;
       }
@@ -559,7 +565,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
       setPaymentStatusMessage(data.customerMessage || 'Please complete the M-Pesa prompt on your phone.');
       setStep(4);
     } catch (err: any) {
-      setPaymentErrors({ phone: err.message || 'Network error initiating payment. Please try again.' });
+      setPaymentErrors({ general: err.message || 'Network error initiating payment. Please try again.' });
       setIsInitiatingPayment(false);
     }
   };
@@ -1124,235 +1130,135 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
               </div>
             </div>
 
-            {/* Form Section: Manual Activation Flow */}
-            {isWaitingForActivation ? (
-              /* WAITING FOR ACTIVATION STATE */
-              <div className="space-y-6 text-center py-2">
-                <div className="w-16 h-16 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center mx-auto animate-pulse">
-                  <Clock className="w-8 h-8 text-amber-600" />
+            {/* AUTOMATED M-PESA PAYMENT FORM */}
+            <form onSubmit={handlePaySubmit} className="space-y-5">
+              <div className="p-4 rounded-2xl bg-emerald-50/80 border border-emerald-200 flex items-center gap-3 text-left">
+                <div className="w-10 h-10 rounded-xl bg-[#00D26A] text-slate-950 flex items-center justify-center font-black text-lg shrink-0">
+                  M
                 </div>
-
-                <div className="space-y-1.5">
-                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-100 text-amber-800 text-xs font-black uppercase tracking-wider">
-                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
-                    WAITING FOR ACTIVATION
-                  </div>
-                  <h3 className="text-xl sm:text-2xl font-black text-slate-900 mt-2">
-                    Payment Code Submitted
+                <div className="text-xs">
+                  <h3 className="font-extrabold text-slate-900 text-sm">
+                    Lipa na M-Pesa Online
                   </h3>
-                  <p className="text-xs sm:text-sm text-slate-600 max-w-md mx-auto leading-relaxed">
-                    Payment code submitted successfully. Your transaction is awaiting verification. Once your payment is confirmed, a confirmation email will be sent to your email address with your secure Open Document link.
+                  <p className="text-slate-600">
+                    Enter your details below. You will receive an instant M-Pesa prompt on your phone to complete payment.
                   </p>
-                </div>
-
-                {/* Dynamic Status Alert Banner */}
-                {paymentStatusMessage === 'activated' && (
-                  <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-950 text-left space-y-1">
-                    <div className="flex items-center gap-2 font-bold text-sm text-emerald-800">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                      <span>Payment Confirmed &amp; Document Activated!</span>
-                    </div>
-                    <p className="text-xs text-emerald-700 leading-relaxed">
-                      A confirmation email containing your secure Open Document link and official receipt has been sent to <strong>{email}</strong>. Please check your email inbox to open your document.
-                    </p>
-                  </div>
-                )}
-
-                {paymentStatusMessage === 'pending' && (
-                  <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-900 text-left text-xs flex items-center gap-2">
-                    <Clock className="w-4 h-4 text-amber-600 shrink-0" />
-                    <span>Verification still pending. Please wait while the administrator verifies your transaction code.</span>
-                  </div>
-                )}
-
-                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-5 text-left space-y-3">
-                  <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider border-b border-slate-200 pb-2">
-                    Customer & Order Summary
-                  </h4>
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <span className="text-slate-500 font-medium">Customer:</span>
-                    <span className="col-span-2 font-bold text-slate-900">{firstName} {secondName}</span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <span className="text-slate-500 font-medium">Email:</span>
-                    <div className="col-span-2">
-                      <span className="font-mono text-slate-900 font-bold">{email}</span>
-                      <p className="text-[11px] text-emerald-700 mt-0.5">
-                        Your document access link and receipt will be delivered to this email.
-                      </p>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <span className="text-slate-500 font-medium">Document:</span>
-                    <span className="col-span-2 font-semibold text-slate-900">{selectedPaper.paper_title} ({selectedPaper.unit_code})</span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <span className="text-slate-500 font-medium">Amount:</span>
-                    <span className="col-span-2 font-bold text-emerald-700">{selectedPaper.price}</span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <span className="text-slate-500 font-medium">M-Pesa Code:</span>
-                    <span className="col-span-2 font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 inline-block">
-                      {manualMpesaCode.toUpperCase()}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="space-y-3 pt-2">
-                  <button
-                    type="button"
-                    onClick={handleCheckActivationStatus}
-                    disabled={checkingActivationStatus}
-                    className="w-full py-3.5 bg-[#00D26A] hover:bg-[#00b55b] disabled:opacity-50 text-slate-950 font-extrabold rounded-xl transition-all shadow-md shadow-[#00D26A]/20 flex items-center justify-center gap-2 text-sm sm:text-base active:scale-[0.98] cursor-pointer"
-                  >
-                    {checkingActivationStatus ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        <span>Checking Status...</span>
-                      </>
-                    ) : (
-                      <>
-                        <RefreshCw className="w-4 h-4" />
-                        <span>Check Activation Status</span>
-                      </>
-                    )}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setIsWaitingForActivation(false)}
-                    className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs transition-colors"
-                  >
-                    Edit Details / Resubmit Code
-                  </button>
                 </div>
               </div>
-            ) : (
-              /* CUSTOMER INFORMATION FORM */
-              <div className="space-y-5">
-                <div className="p-5 rounded-2xl bg-amber-50 border border-amber-200 text-center space-y-3">
-                  <div className="mx-auto w-12 h-12 bg-amber-100 text-amber-700 rounded-full flex items-center justify-center">
-                    <AlertTriangle className="w-6 h-6" />
-                  </div>
-                  <h3 className="text-base font-black text-amber-900 tracking-tight">
-                    Manual M-Pesa Payment
-                  </h3>
-                  <p className="text-sm text-amber-800 leading-snug max-w-sm mx-auto">
-                    1. Please pay <strong>{selectedPaper.price}</strong> via M-Pesa to our PayBill or Till Number.<br/>
-                    2. Enter your details and the M-Pesa Transaction Code below.<br/>
-                    3. Click <strong>SEND CODE</strong> for manual activation.
-                  </p>
+
+              {paymentErrors.general && (
+                <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2 text-left">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>{paymentErrors.general}</span>
                 </div>
-                
-                <div className="space-y-4 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left">
-                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Customer & Payment Information</h4>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide mb-1">
-                        First Name <span className="text-rose-600">*</span>
-                      </label>
-                      <input
-                        type="text"
-                        value={firstName ?? ''}
-                        onChange={(e) => {
-                          setFirstName(e.target.value);
-                          if (paymentErrors.firstName) setPaymentErrors({...paymentErrors, firstName: ''});
-                        }}
-                        placeholder="e.g. John"
-                        className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
-                      />
-                      {paymentErrors.firstName && (
-                        <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.firstName}</p>
-                      )}
-                    </div>
-                    <div>
-                      <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide mb-1">
-                        Second Name <span className="text-rose-600">*</span>
-                      </label>
-                      <input
-                        type="text"
-                        value={secondName ?? ''}
-                        onChange={(e) => {
-                          setSecondName(e.target.value);
-                          if (paymentErrors.secondName) setPaymentErrors({...paymentErrors, secondName: ''});
-                        }}
-                        placeholder="e.g. Kamau"
-                        className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
-                      />
-                      {paymentErrors.secondName && (
-                        <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.secondName}</p>
-                      )}
-                    </div>
-                  </div>
+              )}
 
+              <div className="space-y-4 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-left">
+                <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Customer &amp; Payment Information</h4>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide mb-1">
-                      Email Address <span className="text-rose-600">*</span>
-                    </label>
-                    <input
-                      type="email"
-                      value={email ?? ''}
-                      onChange={(e) => {
-                        setEmail(e.target.value);
-                        if (paymentErrors.email) setPaymentErrors({...paymentErrors, email: ''});
-                      }}
-                      placeholder="e.g. student@example.com"
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
-                    />
-                    {paymentErrors.email ? (
-                      <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.email}</p>
-                    ) : (
-                      <p className="text-[11px] text-slate-400 mt-1">Your document access link and receipt will be delivered to this email.</p>
-                    )}
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide mb-1">
-                      M-Pesa Transaction Code <span className="text-rose-600">*</span>
+                      First Name <span className="text-rose-600">*</span>
                     </label>
                     <input
                       type="text"
-                      value={manualMpesaCode ?? ''}
+                      value={firstName ?? ''}
                       onChange={(e) => {
-                        setManualMpesaCode(e.target.value.toUpperCase());
-                        if (paymentErrors.manualMpesaCode) setPaymentErrors({...paymentErrors, manualMpesaCode: ''});
+                        setFirstName(e.target.value);
+                        if (paymentErrors.firstName) setPaymentErrors({...paymentErrors, firstName: ''});
                       }}
-                      placeholder="e.g. QKT2..."
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all uppercase font-mono"
+                      placeholder="e.g. John"
+                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
                     />
-                    {paymentErrors.manualMpesaCode && (
-                      <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.manualMpesaCode}</p>
+                    {paymentErrors.firstName && (
+                      <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.firstName}</p>
+                    )}
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide mb-1">
+                      Second Name <span className="text-rose-600">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={secondName ?? ''}
+                      onChange={(e) => {
+                        setSecondName(e.target.value);
+                        if (paymentErrors.secondName) setPaymentErrors({...paymentErrors, secondName: ''});
+                      }}
+                      placeholder="e.g. Kamau"
+                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
+                    />
+                    {paymentErrors.secondName && (
+                      <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.secondName}</p>
                     )}
                   </div>
                 </div>
-                
-                <button
-                  type="button"
-                  onClick={handleSendCode}
-                  disabled={isSubmittingCode || !firstName.trim() || !secondName.trim() || !email.trim() || !manualMpesaCode.trim()}
-                  className="w-full py-4 bg-[#00D26A] hover:bg-[#00b55b] disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-extrabold rounded-xl transition-all shadow-md shadow-[#00D26A]/20 flex items-center justify-center gap-2 text-base active:scale-[0.98] cursor-pointer"
-                >
-                  {isSubmittingCode ? (
-                    <>
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      <span>Sending Code...</span>
-                    </>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide mb-1">
+                    Email Address <span className="text-rose-600">*</span>
+                  </label>
+                  <input
+                    type="email"
+                    value={email ?? ''}
+                    onChange={(e) => {
+                      setEmail(e.target.value);
+                      if (paymentErrors.email) setPaymentErrors({...paymentErrors, email: ''});
+                    }}
+                    placeholder="e.g. student@example.com"
+                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all"
+                  />
+                  {paymentErrors.email ? (
+                    <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.email}</p>
                   ) : (
-                    <>
-                      <Send className="w-5 h-5" />
-                      <span>SEND CODE</span>
-                    </>
+                    <p className="text-[11px] text-slate-400 mt-1">Your document access link and receipt will be delivered to this email.</p>
                   )}
-                </button>
-                
-                <div className="text-center pt-1 pb-2">
-                  <p className="text-[11px] text-slate-400 flex items-center justify-center gap-1">
-                    <Lock className="w-3 h-3 text-slate-400" />
-                    <span>Official Godrery Publishers Activation.</span>
-                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide mb-1">
+                    M-Pesa Phone Number <span className="text-rose-600">*</span>
+                  </label>
+                  <input
+                    type="tel"
+                    value={phone ?? ''}
+                    onChange={(e) => {
+                      setPhone(e.target.value);
+                      if (paymentErrors.phone) setPaymentErrors({...paymentErrors, phone: ''});
+                    }}
+                    placeholder="e.g. 0712345678 or 0112345678"
+                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:border-[#00D26A] focus:ring-2 focus:ring-[#00D26A]/20 text-slate-900 text-sm outline-none transition-all font-mono"
+                  />
+                  {paymentErrors.phone ? (
+                    <p className="text-[11px] text-rose-600 font-semibold mt-1">{paymentErrors.phone}</p>
+                  ) : (
+                    <p className="text-[11px] text-slate-400 mt-1">Enter the Safaricom phone number to receive the M-Pesa PIN prompt.</p>
+                  )}
                 </div>
               </div>
-            )}
+
+              <button
+                type="submit"
+                disabled={isInitiatingPayment}
+                className="w-full py-4 bg-[#00D26A] hover:bg-[#00b55b] disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-extrabold rounded-xl transition-all shadow-md shadow-[#00D26A]/20 flex items-center justify-center gap-2 text-base active:scale-[0.98] cursor-pointer"
+              >
+                {isInitiatingPayment ? (
+                  <>
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    <span>Sending M-Pesa Prompt...</span>
+                  </>
+                ) : (
+                  <span>PAY {String(selectedPaper.price).startsWith('KSh') ? selectedPaper.price : `KSh ${selectedPaper.price}`} WITH M-PESA</span>
+                )}
+              </button>
+
+              <div className="text-center pt-1 pb-2">
+                <p className="text-[11px] text-slate-400 flex items-center justify-center gap-1.5">
+                  <Lock className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Secure Safaricom Daraja STK Push &bull; Official Godrery Publishers</span>
+                </p>
+              </div>
+            </form>
           </div>
         )}
         
@@ -1378,19 +1284,36 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
               </p>
             </div>
 
-            {/* Info Box matching image.png */}
-            <div className="p-3.5 rounded-xl bg-sky-50 border border-sky-200 text-sky-800 text-xs flex items-center justify-center gap-2 max-w-md mx-auto">
-              <Info className="w-4 h-4 text-sky-600 shrink-0" />
-              <span>Do not close this page. This may take a few seconds.</span>
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-left text-xs space-y-2 max-w-md mx-auto">
+              <div className="flex justify-between">
+                <span className="text-slate-500">Document:</span>
+                <span className="font-bold text-slate-800">{selectedPaper.paper_title}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">Amount:</span>
+                <span className="font-bold text-emerald-700">{selectedPaper.price}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">M-Pesa Phone:</span>
+                <span className="font-mono font-bold text-slate-800">{phone}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">Delivery Email:</span>
+                <span className="font-mono font-bold text-slate-800">{email}</span>
+              </div>
             </div>
 
-            {/* Disabled Download Button during pending state */}
+            <div className="p-3.5 rounded-xl bg-sky-50 border border-sky-200 text-sky-800 text-xs flex items-center justify-center gap-2 max-w-md mx-auto">
+              <Info className="w-4 h-4 text-sky-600 shrink-0" />
+              <span>Do not close this page. Once you enter your PIN, confirmation is automatic.</span>
+            </div>
+
             <button
-              disabled
-              className="w-full py-3.5 bg-slate-200 text-slate-400 font-bold rounded-xl flex items-center justify-center gap-2 text-sm cursor-not-allowed"
+              type="button"
+              onClick={() => setStep(3)}
+              className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold rounded-xl text-xs transition-colors"
             >
-              <Download className="w-4 h-4" />
-              <span>Download Paper</span>
+              Change Details / Retry
             </button>
           </div>
         )}
@@ -1444,7 +1367,19 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
               </div>
             </div>
 
-                        {/* Open Document Button */}
+            {email && (
+              <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs text-left flex items-start gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-bold">Access Link Sent to Email</p>
+                  <p className="text-[11px] text-emerald-800 mt-0.5">
+                    An official receipt and permanent document access link have also been delivered to <strong>{email}</strong>.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Open Document Button */}
             <button
               onClick={() => {
                 if (accessToken) {
