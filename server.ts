@@ -3382,32 +3382,20 @@ app.get("/api/document/stream/:token", async (req, res) => {
     }
     
     const arrayBuffer = await fileData.arrayBuffer();
-    const pdfUint8 = new Uint8Array(arrayBuffer);
+    const pdfBuffer = Buffer.from(arrayBuffer);
     
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(ENCRYPTION_KEY), iv);
-    const encrypted = Buffer.concat([cipher.update(pdfUint8), cipher.final()]);
-    const authTag = cipher.getAuthTag();
-    
-    const payload = JSON.stringify({
-        filename: `${paper.unit_code}.pdf`,
-        contentType: 'application/pdf'
-    });
-    const payloadBuffer = Buffer.from(payload, 'utf-8');
-    const payloadLength = Buffer.alloc(4);
-    payloadLength.writeUInt32BE(payloadBuffer.length, 0);
-    
-    const encryptedBytes = Buffer.concat([
-        iv,
-        authTag,
-        payloadLength,
-        payloadBuffer,
-        encrypted
-    ]);
-    
-    res.setHeader('Content-Type', 'application/octet-stream');
-    console.log(`[ACCESS LOG] Successfully streamed encrypted document to device ${deviceId} for order ${orderId}`);
-    return res.send(Buffer.from(encryptedBytes));
+    const safeUnitCode = (paper.unit_code || 'document').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const safeFilename = `${safeUnitCode}.pdf`;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${safeFilename}"`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    console.log(`[ACCESS LOG] Successfully streamed PDF document to device ${deviceId} for order ${orderId} (${pdfBuffer.length} bytes)`);
+    return res.end(pdfBuffer);
 });
 
 
