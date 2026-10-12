@@ -1729,8 +1729,30 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
 // TEMPORARY: Isolated Administrator/Developer Payment Simulation Endpoint
 // Safely executes the exact downstream post-payment fulfillment architecture without touching real M-Pesa callback.
 app.post("/api/admin/simulate-successful-payment", async (req, res) => {
-  // 1. Guard check: Must be explicitly enabled via environment variable
+  // 0. Secret-safe diagnostic logging (strictly boolean flags; never logs secrets, raw headers, or request bodies)
   const isSimulationEnabled = process.env.ENABLE_PAYMENT_SIMULATION === 'true';
+  const configuredSimSecret = process.env.SIMULATION_SECRET?.trim();
+  const rawSimHeader = req.headers['x-simulation-secret'];
+  const isHeaderPresent = Boolean(rawSimHeader);
+  const isSecretConfigured = Boolean(configuredSimSecret && configuredSimSecret.length > 0);
+  const trimmedSimHeader = typeof rawSimHeader === 'string' ? rawSimHeader.trim() : '';
+  const isHeaderMatch = Boolean(isSecretConfigured && isHeaderPresent && rawSimHeader === configuredSimSecret);
+  const isHeaderTrimmedMatch = Boolean(
+    isSecretConfigured &&
+    isHeaderPresent &&
+    trimmedSimHeader.length > 0 &&
+    trimmedSimHeader === configuredSimSecret
+  );
+
+  console.log('[SIMULATION-AUTH-DIAGNOSTIC]', {
+    ENABLE_PAYMENT_SIMULATION_is_true: isSimulationEnabled,
+    SIMULATION_SECRET_configured: isSecretConfigured,
+    x_simulation_secret_header_present: isHeaderPresent,
+    supplied_header_matches_configured_secret: isHeaderMatch,
+    supplied_header_trimmed_matches_secret: isHeaderTrimmedMatch
+  });
+
+  // 1. Guard check: Must be explicitly enabled via environment variable
   if (!isSimulationEnabled) {
     return res.status(403).json({
       success: false,
@@ -1741,7 +1763,6 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
   // 2. Authentication check: Require valid Admin JWT OR dedicated SIMULATION_SECRET
   const authHeader = req.headers.authorization || '';
   const simulationSecretHeader = req.headers['x-simulation-secret'] || req.body?.simulationSecret;
-  const configuredSimSecret = process.env.SIMULATION_SECRET;
 
   let isAuthorized = false;
   if (authHeader.startsWith("Bearer ")) {
@@ -1754,7 +1775,14 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
     }
   }
 
-  if (!isAuthorized && configuredSimSecret && simulationSecretHeader === configuredSimSecret) {
+  const candidateSimSecret = typeof simulationSecretHeader === 'string' ? simulationSecretHeader.trim() : '';
+
+  if (
+    !isAuthorized &&
+    isSecretConfigured &&
+    candidateSimSecret.length > 0 &&
+    candidateSimSecret === configuredSimSecret
+  ) {
     isAuthorized = true;
   }
 
@@ -1799,14 +1827,30 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
 
     // Customer record creation or lookup
     let customerId: string | null = null;
-    const { data: existingCustomer } = await supabaseAdmin
+    const { data: existingCustomer, error: existingCustErr } = await supabaseAdmin
       .from("customers")
       .select("id")
       .eq("phone", normalizedPhone)
       .maybeSingle();
 
+    if (existingCustErr) {
+      return res.status(500).json({ success: false, error: "Failed to query customer records." });
+    }
+
     if (existingCustomer?.id) {
       customerId = existingCustomer.id;
+      // Update existing customer's names to match current simulation request
+      const { error: updateCustErr } = await supabaseAdmin
+        .from("customers")
+        .update({
+          first_name: targetFirstName,
+          second_name: targetSecondName
+        })
+        .eq("id", customerId);
+      if (updateCustErr) {
+        console.error("[SIMULATION ERROR] Failed to update customer names:", updateCustErr);
+        return res.status(500).json({ success: false, error: "Failed to update existing customer record." });
+      }
     } else {
       const { data: newCust, error: custErr } = await supabaseAdmin
         .from("customers")
@@ -1896,8 +1940,7 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
 
     // Generate secure document access token
     const accessToken = generateAccessToken(orderId);
-    const appUrl = (process.env.APP_URL || 'https://godrerypublishers.co.ke').replace(/\/+$/, '');
-    const openDocumentUrl = `${appUrl}/document/access/${accessToken}`;
+    const openDocumentUrl = getDocumentAccessUrl(req, accessToken);
 
     // Trigger SMTP document activation email using existing Nodemailer email service
     let emailStatus = 'pending';
