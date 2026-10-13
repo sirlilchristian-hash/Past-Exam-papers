@@ -9,7 +9,6 @@ export interface PaperFormValidationErrors {
 
 export type AdminSection =
   | 'dashboard'
-  | 'activate_code'
   | 'orders'
   | 'payments'
   | 'papers'
@@ -36,6 +35,10 @@ export interface TransactionRecord {
   passwordUsed?: string;
   status: 'Completed' | 'Pending' | 'Failed' | string;
   timestamp: string;
+  purchased_pages?: number[] | null;
+  page_quantity?: number | null;
+  unit_price?: number | null;
+  purchase_type?: string;
 }
 
 export interface DeviceRequest {

@@ -85,17 +85,27 @@ export async function generateAndMergeReceipt(orderId: string): Promise<boolean>
             y -= (size + 10);
         };
 
+        const isSimulated = Boolean(payment?.mpesa_receipt?.startsWith('SIM'));
+
         drawText('Godrery Publishers', 24, true);
         y -= 10;
-        drawText('PURCHASE RECEIPT', 18, true, rgb(0.2, 0.2, 0.2));
-        y -= 20;
+        if (isSimulated) {
+            drawText('PURCHASE RECEIPT (SIMULATED TEST PAYMENT)', 16, true, rgb(0.8, 0.4, 0));
+            drawText('*** SIMULATION MODE - NOT A GENUINE SAFARICOM M-PESA RECEIPT ***', 10, true, rgb(0.7, 0.2, 0.2));
+        } else {
+            drawText('PURCHASE RECEIPT', 18, true, rgb(0.2, 0.2, 0.2));
+        }
+        y -= 15;
 
         const dateStr = payment?.transaction_date 
             ? new Date(payment.transaction_date).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })
             : new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
 
         drawText(`Date (EAT): ${dateStr}`, 12);
-        drawText(`Receipt Ref: ${payment?.mpesa_receipt || 'Manual/N/A'}`, 12);
+        const receiptLabel = isSimulated 
+            ? `Receipt Ref: ${payment?.mpesa_receipt || 'SIMULATED'} [TEST SIMULATION]`
+            : `Receipt Ref: ${payment?.mpesa_receipt || 'Manual/N/A'}`;
+        drawText(receiptLabel, 12);
         drawText(`Order ID: ${orderId}`, 10, false, rgb(0.5, 0.5, 0.5));
         y -= 15;
         

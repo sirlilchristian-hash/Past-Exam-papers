@@ -98,6 +98,42 @@ export const OrderInquiryModal: React.FC<OrderInquiryModalProps> = ({ order, onC
           </div>
 
           <div className="flex justify-between items-center">
+            <span className="text-slate-400">Purchase Mode</span>
+            <span className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase border ${
+              order.purchased_pages && order.purchased_pages.length > 0
+                ? 'bg-purple-500/10 text-purple-300 border-purple-500/30'
+                : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+            }`}>
+              {order.purchased_pages && order.purchased_pages.length > 0 ? 'Option B: Selected Pages' : 'Option A: Whole Document'}
+            </span>
+          </div>
+
+          {order.purchased_pages && order.purchased_pages.length > 0 && (
+            <>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">Selected Pages</span>
+                <span className="font-bold text-white">
+                  {order.page_quantity || order.purchased_pages.length} Pages
+                </span>
+              </div>
+              <div className="flex justify-between items-start gap-2">
+                <span className="text-slate-400 shrink-0">Pages Snapshot</span>
+                <span className="font-mono text-emerald-400 font-bold text-right break-all">
+                  [{order.purchased_pages.join(', ')}]
+                </span>
+              </div>
+              {order.unit_price && (
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Unit Price</span>
+                  <span className="font-semibold text-slate-300">
+                    KSh {order.unit_price} / page
+                  </span>
+                </div>
+              )}
+            </>
+          )}
+
+          <div className="flex justify-between items-center">
             <span className="text-slate-400">M-Pesa Receipt</span>
             <div className="flex items-center gap-1.5 font-mono font-black text-amber-300">
               <span>{order.mpesaReceipt || 'PENDING'}</span>

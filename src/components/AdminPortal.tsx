@@ -28,7 +28,6 @@ import {
 import { AdminSidebar } from './admin/AdminSidebar';
 import { AdminTopHeader } from './admin/AdminTopHeader';
 import { AdminDashboardView } from './admin/AdminDashboardView';
-import { AdminActivateCodeView } from './admin/AdminActivateCodeView';
 import { AdminOrdersView } from './admin/AdminOrdersView';
 import { AdminPaymentsView } from './admin/AdminPaymentsView';
 import { AdminPapersView } from './admin/AdminPapersView';
@@ -98,15 +97,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   // Data Collections
   const [transactions, setTransactions] = useState<TransactionRecord[]>([]);
-  const [pendingActivations, setPendingActivations] = useState<any[]>([]);
   const [deviceRequests, setDeviceRequests] = useState<DeviceRequest[]>([]);
   const [affiliates, setAffiliates] = useState<AffiliateRecord[]>([]);
 
   // Refresh Indicators
   const [isRefreshingAll, setIsRefreshingAll] = useState<boolean>(false);
-  const [isRefreshingActivations, setIsRefreshingActivations] = useState<boolean>(false);
   const [isRefreshingDeviceReqs, setIsRefreshingDeviceReqs] = useState<boolean>(false);
-  const [isActivatingId, setIsActivatingId] = useState<string | null>(null);
   const [isResendingEmail, setIsResendingEmail] = useState<boolean>(false);
 
   // Modals State
@@ -188,28 +184,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     };
   }, [isOpen]);
 
-  // Fetch pending activations
-  const fetchPendingActivations = async () => {
-    try {
-      setIsRefreshingActivations(true);
-      const res = await fetch('/api/admin/manual-activation/pending', {
-        headers: { Authorization: `Bearer ${localStorage.getItem('admin_token')}` },
-      });
-      if (res.status === 401 || res.status === 403) {
-        handleLogout();
-        setLoginError('Your administrative session has expired. Please sign in again.');
-        return;
-      }
-      if (res.ok) {
-        const data = await res.json();
-        setPendingActivations(Array.isArray(data) ? data : []);
-      }
-    } catch (err) {
-      console.error('Failed to load pending activations:', err);
-    } finally {
-      setIsRefreshingActivations(false);
-    }
-  };
+
 
   // Fetch transactions / orders
   const fetchTransactions = async () => {
@@ -284,7 +259,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     try {
       await Promise.allSettled([
         fetchTransactions(),
-        fetchPendingActivations(),
         fetchDeviceRequests(),
         fetchAffiliates(),
         onRefreshPapers ? onRefreshPapers() : Promise.resolve(),
@@ -345,28 +319,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     setPassword('');
   };
 
-  // Handle Manual Code Activation (ACTIVATE Button)
-  const handleActivateRequest = async (orderId: string) => {
-    try {
-      setIsActivatingId(orderId);
-      const res = await fetch(`/api/admin/orders/${orderId}/activate`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${localStorage.getItem('admin_token')}` },
-      });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setActivationResultModal(data.result);
-        fetchPendingActivations();
-        fetchTransactions();
-      } else {
-        alert(data.error || 'Failed to activate order.');
-      }
-    } catch (err) {
-      alert('Network connection error during activation.');
-    } finally {
-      setIsActivatingId(null);
-    }
-  };
+
 
   // Handle Resending Activation Email
   const handleResendEmail = async (orderId: string) => {
@@ -766,7 +719,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         }}
         onLogout={handleLogout}
         adminRole={adminRole}
-        pendingActivationsCount={pendingActivations.length}
         pendingDeviceRequestsCount={
           deviceRequests.filter((r) => (r.status || '').toLowerCase() === 'pending').length
         }
@@ -783,7 +735,6 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           isRefreshing={isRefreshingAll}
           onClosePortal={onClose}
           onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
-          pendingActivationsCount={pendingActivations.length}
         />
 
         {/* Scrollable Viewport Area */}
@@ -793,20 +744,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
             <AdminDashboardView
               papers={papers}
               transactions={transactions}
-              pendingActivations={pendingActivations}
               deviceRequests={deviceRequests}
               affiliates={affiliates}
               onNavigate={(sec) => setActiveSection(sec)}
-            />
-          )}
-
-          {activeSection === 'activate_code' && (
-            <AdminActivateCodeView
-              pendingActivations={pendingActivations}
-              onActivate={handleActivateRequest}
-              isActivatingId={isActivatingId}
-              onRefresh={fetchPendingActivations}
-              isRefreshing={isRefreshingActivations}
             />
           )}
 

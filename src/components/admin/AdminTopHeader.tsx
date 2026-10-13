@@ -9,19 +9,13 @@ interface AdminTopHeaderProps {
   onRefreshAll: () => void;
   isRefreshing: boolean;
   onClosePortal: () => void;
-  pendingActivationsCount?: number;
 }
 
 const SECTION_METADATA: Record<AdminSection, { title: string; category: string; description: string }> = {
   dashboard: {
     title: 'Operational Dashboard',
     category: 'Overview',
-    description: 'Real-time metrics, pending activations, and recent system operations',
-  },
-  activate_code: {
-    title: 'Manual Code Activation',
-    category: 'Sales',
-    description: 'Process and verify customer manual M-Pesa activations with instant document delivery',
+    description: 'Real-time metrics, system health, and recent order activity',
   },
   orders: {
     title: 'Orders Directory',
@@ -87,7 +81,6 @@ export const AdminTopHeader: React.FC<AdminTopHeaderProps> = ({
   onRefreshAll,
   isRefreshing,
   onClosePortal,
-  pendingActivationsCount,
 }) => {
   const handleOpenMenu = onToggleSidebar || onOpenMobileSidebar;
   const meta = SECTION_METADATA[activeSection] || {

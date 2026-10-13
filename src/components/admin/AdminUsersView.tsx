@@ -57,7 +57,7 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
     }
 
     try {
-      const res = await fetch(`/api/admin/users/${user.id}/status`, {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(user.account_id)}`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -81,7 +81,7 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
     if (!resettingUser || !newPassword) return;
     try {
       setIsResetting(true);
-      const res = await fetch(`/api/admin/users/${resettingUser.id}/reset-password`, {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(resettingUser.account_id)}/reset-password`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -109,7 +109,7 @@ export const AdminUsersView: React.FC<AdminUsersViewProps> = ({
     if (!roleUser || !selectedRole) return;
     try {
       setIsUpdatingRole(true);
-      const res = await fetch(`/api/admin/users/${roleUser.id}/role`, {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(roleUser.account_id)}`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',

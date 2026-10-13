@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Search,
   ArrowLeft,
@@ -25,9 +25,16 @@ import {
   Send,
   Mail,
   RefreshCw,
+  SlidersHorizontal,
+  Layers,
+  CheckSquare,
+  Square,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
 import { ExamPaperAdminItem } from './AdminPortal';
+import { calculateAuthoritativePagesPrice, PagePricingModel, PagePriceRange } from '../lib/pricingCalculator';
 
 interface SearchPaperWorkflowProps {
   initialUnitQuery?: string;
@@ -42,6 +49,13 @@ interface PaperItem {
   price: string | number;
   status: string;
   file_path: string;
+  eligible_pages?: number[];
+  total_pages?: number;
+  pricing_model?: PagePricingModel;
+  fixed_page_price?: number;
+  page_price_ranges?: PagePriceRange[];
+  custom_page_prices?: Record<string | number, number>;
+  min_page_limit?: number;
 }
 
 const PdfDocLockBadge: React.FC<{ size?: 'sm' | 'md' | 'lg' }> = ({ size = 'md' }) => {
@@ -203,15 +217,14 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
   const [email, setEmail] = useState<string>('');
   const [phone, setPhone] = useState<string>('');
   const [paymentErrors, setPaymentErrors] = useState<Record<string, string>>({});
-  const [manualMpesaCode, setManualMpesaCode] = useState('');
   const [currentOrderId, setCurrentOrderId] = useState<string | null>(null);
+  const [checkoutToken, setCheckoutToken] = useState<string>('');
   const [accessToken, setAccessToken] = useState<string>('');
   const [mpesaReceipt, setMpesaReceipt] = useState<string>('');
   const [isInitiatingPayment, setIsInitiatingPayment] = useState<boolean>(false);
+  const [isUncertain, setIsUncertain] = useState<boolean>(false);
+  const submittingRef = useRef<boolean>(false);
   const [paymentStatusMessage, setPaymentStatusMessage] = useState<string>('');
-  const [isSubmittingCode, setIsSubmittingCode] = useState<boolean>(false);
-  const [isWaitingForActivation, setIsWaitingForActivation] = useState<boolean>(false);
-  const [checkingActivationStatus, setCheckingActivationStatus] = useState<boolean>(false);
 
   // In-App Password Unlock Modal State
   const [showUnlockModal, setShowUnlockModal] = useState<boolean>(false);
@@ -222,6 +235,24 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
   // Download Triggered State
   const [hasDownloaded, setHasDownloaded] = useState<boolean>(false);
   const [isProcessingWhatsApp, setIsProcessingWhatsApp] = useState<boolean>(false);
+  const [purchaseType, setPurchaseType] = useState<'full' | 'pages'>('full');
+  const [pageQuantity, setPageQuantity] = useState<number>(6);
+  const [isDetailsExpanded, setIsDetailsExpanded] = useState<boolean>(false);
+
+  const totalPagesForSelected = selectedPaper ? (Number(selectedPaper.total_pages) || 12) : 12;
+  const lastNPages = Array.from({ length: pageQuantity }, (_, i) => totalPagesForSelected - pageQuantity + i + 1);
+
+  const pagesPricing = selectedPaper
+    ? calculateAuthoritativePagesPrice(selectedPaper, lastNPages)
+    : { totalAmount: 0, breakdown: '', pricingModel: 'fixed' as const, unitPriceSummary: '', itemizedDetails: [], isValid: false };
+
+  const fullPaperNumericPrice = selectedPaper
+    ? (typeof selectedPaper.price === 'number'
+        ? selectedPaper.price
+        : parseInt(String(selectedPaper.price).replace(/[^\d]/g, '') || '50', 10))
+    : 50;
+
+  const finalAmount = purchaseType === 'pages' ? pagesPricing.totalAmount : fullPaperNumericPrice;
 
   useEffect(() => {
     if (initialUnitQuery) {
@@ -340,6 +371,13 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
         file_path: adminItem.file_path || (adminItem as any).fileName || `${overrideCode || getPCode(adminItem) || 'Paper'}.pdf`,
         price: typeof adminItem.price === 'number' ? `KSh ${adminItem.price}` : (adminItem.price || 'KSh 50'),
         status: isPAvailable(adminItem) ? 'available' : 'unavailable',
+        eligible_pages: adminItem.eligible_pages,
+        total_pages: adminItem.total_pages || (Array.isArray(adminItem.eligible_pages) ? adminItem.eligible_pages.length : 12),
+        pricing_model: adminItem.pricing_model,
+        fixed_page_price: adminItem.fixed_page_price,
+        page_price_ranges: adminItem.page_price_ranges,
+        custom_page_prices: adminItem.custom_page_prices,
+        min_page_limit: adminItem.min_page_limit,
       });
 
       // CASE A: Both name and code point to DIFFERENT documents in admin (UNRELATED DATA)
@@ -416,105 +454,38 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
     }
   };
 
-  // Handle selecting a specific paper directly and advancing
+  // Handle selecting a specific paper directly and showing details
   const handleSelectPaperAndProceed = (paper: PaperItem) => {
     setSelectedPaper(paper);
+    setResultPapers([paper]);
     setUnitName(getPTitle(paper) || '');
     setUnitCode(getPCode(paper) || '');
-    setStep(3);
+    setIsDetailsExpanded(true);
+  };
+
+  // Handle View Details & Purchase Options
+  const handleViewDetails = (paper?: PaperItem) => {
+    if (paper) {
+      setSelectedPaper(paper);
+      setResultPapers([paper]);
+      setUnitName(getPTitle(paper) || '');
+      setUnitCode(getPCode(paper) || '');
+    }
+    setIsDetailsExpanded(true);
   };
 
   // Handle Proceed to Payment Form (Step 2 -> Step 3)
-  const handleViewDetails = () => {
+  const handleProceedToCheckout = () => {
     setStep(3);
   };
 
   // Handle Initiate Real M-Pesa STK Push (Step 3 -> Step 4)
-  
-  // Handle Manual Activation Code Submission
-  const handleSendCode = async () => {
-    const errors: Record<string, string> = {};
-
-    if (!firstName.trim()) errors.firstName = 'First name is required';
-    if (!secondName.trim()) errors.secondName = 'Second name is required';
-
-    const emailTrimmed = email.trim().toLowerCase();
-    if (!emailTrimmed) {
-      errors.email = 'Email address is required';
-    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailTrimmed)) {
-      errors.email = 'Please enter a valid email address';
-    }
-
-    const codeTrimmed = manualMpesaCode.trim().toUpperCase();
-    if (!codeTrimmed) {
-      errors.manualMpesaCode = 'M-Pesa transaction code is required';
-    } else if (codeTrimmed.length < 5) {
-      errors.manualMpesaCode = 'Please enter a valid M-Pesa transaction code';
-    }
-
-    if (Object.keys(errors).length > 0) {
-      setPaymentErrors(errors);
-      return;
-    }
-
-    if (!selectedPaper) return;
-    setPaymentErrors({});
-    setIsSubmittingCode(true);
-
-    try {
-      const res = await fetch('/api/manual-activation/request', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          paperId: selectedPaper.id,
-          firstName: firstName.trim(),
-          secondName: secondName.trim(),
-          email: emailTrimmed,
-          mpesaCode: codeTrimmed,
-          orderId: currentOrderId || undefined,
-        }),
-      });
-
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        setPaymentErrors({ manualMpesaCode: data.error || 'Failed to submit activation request.' });
-        return;
-      }
-
-      setCurrentOrderId(data.orderId);
-      setMpesaReceipt(codeTrimmed);
-      setPaymentStatusMessage('');
-      setIsWaitingForActivation(true);
-    } catch (err) {
-      console.error('Activation submission error:', err);
-      setPaymentErrors({ manualMpesaCode: 'Network error submitting your code. Please try again.' });
-    } finally {
-      setIsSubmittingCode(false);
-    }
-  };
-
-  const handleCheckActivationStatus = async () => {
-    if (!currentOrderId) return;
-    setCheckingActivationStatus(true);
-    try {
-      const res = await fetch(`/api/orders/${currentOrderId}/status`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.isPaid || data.orderStatus === 'paid') {
-          setPaymentStatusMessage('activated');
-        } else {
-          setPaymentStatusMessage('pending');
-        }
-      }
-    } catch (err) {
-      console.error('Error checking activation status:', err);
-    } finally {
-      setCheckingActivationStatus(false);
-    }
-  };
-
   const handlePaySubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    
+    // Guard: Return immediately if submission is already in progress
+    if (submittingRef.current) return;
+
     const errors: Record<string, string> = {};
 
     if (!firstName.trim()) errors.firstName = 'First name is required';
@@ -538,6 +509,9 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
     if (!selectedPaper) return;
 
     setPaymentErrors({});
+    
+    // Guard: Lock the submission before the request
+    submittingRef.current = true;
     setIsInitiatingPayment(true);
 
     try {
@@ -550,23 +524,50 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
           second_name: secondName.trim(),
           email: email.trim(),
           phone: phone.trim(),
+          purchase_type: purchaseType,
+          ...(purchaseType === 'pages' ? {
+            page_quantity: pageQuantity,
+          } : {}),
         }),
       });
 
       const data = await res.json();
-      if (!res.ok || !data.success) {
+
+      // 1. Check for Definitive Failure (Safe to retry: pre-validation or explicit Daraja rejection)
+      if (data.outcome === "definite_failure" && data.uncertainOutcome !== true && data.success !== true) {
         setPaymentErrors({ general: data.error || 'Failed to initiate M-Pesa STK push.' });
         setIsInitiatingPayment(false);
+        submittingRef.current = false; // UNLOCK for safe retry
         return;
       }
 
-      setCurrentOrderId(data.orderId);
+      // 2. Check for Valid Success
+      if (res.ok && data.success === true && typeof data.orderId === 'string' && data.orderId.trim().length > 0) {
+        setCurrentOrderId(data.orderId);
+        if (data.checkoutToken) {
+          setCheckoutToken(data.checkoutToken);
+        }
+        setIsInitiatingPayment(false);
+        setPaymentStatusMessage(data.customerMessage || 'Please complete the M-Pesa prompt on your phone.');
+        setStep(4);
+        // Guard remains locked for successful payment workflow
+        return;
+      }
+
+      // 3. Everything else (202, 504, !res.ok, uncertain, or malformed success) is Uncertain
+      setIsUncertain(true);
+      setPaymentErrors({ 
+        general: data.error || 'The payment request may have been initiated, but we could not confirm its status. Please check your phone for an M-Pesa prompt. Do not attempt to initiate another payment.' 
+      });
       setIsInitiatingPayment(false);
-      setPaymentStatusMessage(data.customerMessage || 'Please complete the M-Pesa prompt on your phone.');
-      setStep(4);
+      // Guard remains LOCKED - Never unlock on uncertain/ambiguous outcomes
     } catch (err: any) {
-      setPaymentErrors({ general: err.message || 'Network error initiating payment. Please try again.' });
+      setPaymentErrors({ 
+        general: 'Network error initiating payment. Please check your phone, do not retry, and contact support if needed.' 
+      });
       setIsInitiatingPayment(false);
+      setIsUncertain(true);
+      // Guard remains locked on error
     }
   };
 
@@ -579,7 +580,8 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
     const interval = setInterval(async () => {
       attempts++;
       try {
-        const res = await fetch(`/api/orders/${currentOrderId}/status`);
+        const queryParam = checkoutToken ? `?checkoutToken=${encodeURIComponent(checkoutToken)}` : '';
+        const res = await fetch(`/api/orders/${currentOrderId}/status${queryParam}`);
         if (res.ok) {
           const data = await res.json();
           if (data.isPaid || data.orderStatus === 'paid') {
@@ -610,7 +612,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
     }, 2500);
 
     return () => clearInterval(interval);
-  }, [step, currentOrderId]);
+  }, [step, currentOrderId, checkoutToken]);
 
   // Handle Trigger Real Encrypted PDF File Download (Protected & Uneditable Format)
   const handleDownloadPaper = async () => {
@@ -658,9 +660,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
   const handleResetSearch = () => {
     setStep(1);
     setHasDownloaded(false);
-    setIsWaitingForActivation(false);
     setEmail('');
-    setManualMpesaCode('');
     setCurrentOrderId(null);
   };
 
@@ -1084,15 +1084,165 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
                   </div>
                 )}
 
-                <div className="pt-2 flex justify-end">
-                  <button
-                    onClick={handleViewDetails}
-                    disabled={selectedPaper.status !== 'available'}
-                    className="px-6 py-2.5 bg-[#00D26A] hover:bg-[#00b85c] disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed text-slate-950 font-black rounded-full transition-all text-xs sm:text-sm inline-flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
-                  >
-                    <span>{selectedPaper.status === 'available' ? 'View Details' : 'Unavailable'}</span>
-                    {selectedPaper.status === 'available' && <ArrowRight className="w-4 h-4" />}
-                  </button>
+                {/* DUAL-PURCHASE SYSTEM (Option A: Buy Whole Document vs Option B: Buy Selected Pages) */}
+                <div className="space-y-4 pt-4 border-t border-slate-200 bg-white p-4 sm:p-5 rounded-2xl shadow-xs text-left animate-fadeIn">
+                  <div>
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <h4 className="text-xs font-black text-slate-800 uppercase tracking-wider flex items-center gap-2">
+                        <span>Select Purchase Option</span>
+                        <span className="text-[10px] font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300">
+                          Dual Purchase System
+                        </span>
+                      </h4>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Choose whether to purchase the complete exam paper or select specific individual pages or ranges.
+                    </p>
+                  </div>
+
+                  <div className="space-y-3">
+                    {/* OPTION A: Buy Whole Document */}
+                    <div
+                      onClick={() => setPurchaseType('full')}
+                      className={`p-4 rounded-2xl border-2 transition-all cursor-pointer ${
+                        purchaseType === 'full'
+                          ? 'border-[#00D26A] bg-emerald-50/60 ring-2 ring-[#00D26A]/20 shadow-xs'
+                          : 'border-slate-200 bg-white hover:border-slate-300'
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <input
+                          type="radio"
+                          name="purchaseModeRadio"
+                          checked={purchaseType === 'full'}
+                          onChange={() => setPurchaseType('full')}
+                          className="mt-1 text-[#00D26A] focus:ring-[#00D26A]"
+                        />
+                        <div className="flex-1 space-y-1">
+                          <div className="flex items-center justify-between flex-wrap gap-2">
+                            <span className="font-black text-slate-900 text-sm">
+                              Option A — Buy Whole Document
+                            </span>
+                            <span className="font-black text-emerald-800 text-sm bg-white px-2.5 py-0.5 rounded-full border border-emerald-300 shadow-2xs">
+                              {selectedPaper.price}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-600 leading-relaxed">
+                            Provides immediate, unrestricted access to the complete examination paper including all sections, questions, and official structure upon verified payment.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* OPTION B: Buy Selected Pages (Last-N-Pages) */}
+                    {(() => {
+                      const totalPages = Number(selectedPaper.total_pages) || 12;
+
+                      return (
+                        <div
+                          onClick={() => setPurchaseType('pages')}
+                          className={`p-4 rounded-2xl border-2 transition-all cursor-pointer ${
+                            purchaseType === 'pages'
+                              ? 'border-[#00D26A] bg-emerald-50/60 ring-2 ring-[#00D26A]/20 shadow-xs'
+                              : 'border-slate-200 bg-white hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-start gap-3">
+                            <input
+                              type="radio"
+                              name="purchaseModeRadio"
+                              checked={purchaseType === 'pages'}
+                              onChange={() => setPurchaseType('pages')}
+                              className="mt-1 text-[#00D26A] focus:ring-[#00D26A]"
+                            />
+                            <div className="flex-1 space-y-2">
+                              <div className="flex items-center justify-between flex-wrap gap-2">
+                                <span className="font-black text-slate-900 text-sm">
+                                  Option B — Buy Selected Pages (Last N Pages)
+                                </span>
+                                <span className="text-xs font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300">
+                                  {totalPages} pages total
+                                </span>
+                              </div>
+
+                              <p className="text-xs text-slate-600 leading-relaxed">
+                                Purchase the last <strong className="font-extrabold text-slate-900">{pageQuantity}</strong> pages of the document (pages <strong className="font-mono font-bold text-slate-900">{Math.max(1, totalPages - pageQuantity + 1)}–{totalPages}</strong>). Automatically selected from the end of the document.
+                              </p>
+
+                              {purchaseType === 'pages' && (
+                                <div className="pt-3 mt-2 border-t border-emerald-200/80 space-y-3">
+                                  <div className="flex items-center justify-between flex-wrap gap-2 text-xs">
+                                    <span className="font-bold text-slate-700">Select Page Quantity (N):</span>
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                      {[6, 10, 15, 20, Math.min(totalPages, 30)].filter((q, idx, arr) => q <= totalPages && arr.indexOf(q) === idx).map((qty) => (
+                                        <button
+                                          key={qty}
+                                          type="button"
+                                          onClick={(e) => { e.stopPropagation(); setPageQuantity(qty); }}
+                                          className={`px-3 py-1 font-bold rounded-lg border text-xs transition-all cursor-pointer ${
+                                            pageQuantity === qty
+                                              ? 'bg-emerald-600 text-white border-emerald-700 shadow-xs'
+                                              : 'bg-white hover:bg-slate-100 text-slate-800 border-slate-300'
+                                          }`}
+                                        >
+                                          {qty} Pages
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+
+                                  <div className="flex items-center gap-3 text-xs">
+                                    <span className="font-bold text-slate-700">Custom Quantity:</span>
+                                    <input
+                                      type="number"
+                                      min="6"
+                                      max={totalPages}
+                                      value={pageQuantity}
+                                      onClick={(e) => e.stopPropagation()}
+                                      onChange={(e) => {
+                                        const val = parseInt(e.target.value, 10);
+                                        if (!isNaN(val)) setPageQuantity(Math.max(6, Math.min(totalPages, val)));
+                                      }}
+                                      className="w-20 px-2.5 py-1.5 rounded-lg border border-slate-300 font-bold text-xs bg-white"
+                                    />
+                                    <span className="text-slate-500 text-[11px]">(Min 6, Max {totalPages})</span>
+                                  </div>
+
+                                  <div className="p-3.5 bg-emerald-100/60 rounded-xl border border-emerald-300 text-xs space-y-1.5">
+                                    <div className="flex items-center justify-between text-emerald-950">
+                                      <span className="font-bold">Purchased Page Span:</span>
+                                      <span className="font-mono font-black text-emerald-950">
+                                        [{Math.max(1, totalPages - pageQuantity + 1)} ... {totalPages}] ({pageQuantity} pages)
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center justify-between text-emerald-950 font-black text-sm pt-1 border-t border-emerald-200">
+                                      <span>Authoritative Amount:</span>
+                                      <span className="text-base text-emerald-800">KSh {pagesPricing.totalAmount}</span>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  {/* Proceed to Checkout Action */}
+                  <div className="pt-3 flex justify-end border-t border-slate-200">
+                    <button
+                      onClick={handleProceedToCheckout}
+                      disabled={
+                        selectedPaper.status !== 'available' ||
+                        (purchaseType === 'pages' && !pagesPricing.isValid)
+                      }
+                      className="px-6 py-2.5 bg-[#00D26A] hover:bg-[#00b85c] disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed text-slate-950 font-black rounded-full transition-all text-xs sm:text-sm inline-flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer"
+                    >
+                      <span>Proceed to Checkout</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : null}
@@ -1114,20 +1264,56 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
               <span>Back to results</span>
             </button>
 
-            {/* Document Details Banner Header */}
-            <div className="flex items-start justify-between pb-4 border-b border-slate-200">
-              <div>
-                <h2 className="text-lg sm:text-xl font-black text-slate-900 leading-tight">
-                  {selectedPaper.paper_title} Paper 1 – 2024
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Unit Code: <strong className="text-slate-700">{selectedPaper.unit_code}</strong>
-                </p>
+            {/* Selected Purchase Summary Card */}
+            <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm space-y-3.5 text-left">
+              <div className="flex items-start justify-between gap-3 flex-wrap">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[11px] font-extrabold uppercase px-2.5 py-0.5 rounded-full border bg-emerald-50 text-emerald-800 border-emerald-300">
+                      {purchaseType === 'pages' ? 'Option B: Selected Pages' : 'Option A: Whole Document'}
+                    </span>
+                    <span className="bg-rose-100 text-rose-700 font-black text-[10px] px-2 py-0.5 rounded-full border border-rose-200 uppercase tracking-tight">
+                      PDF Format
+                    </span>
+                  </div>
+                  <h2 className="text-lg sm:text-xl font-black text-slate-900 leading-tight">
+                    {selectedPaper.paper_title} Paper 1 – 2024
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    Respective Unit Code: <strong className="font-mono bg-emerald-100 text-emerald-950 px-1.5 py-0.5 rounded text-xs font-bold">{selectedPaper.unit_code}</strong>
+                  </p>
+                </div>
+
+                <div className="text-right shrink-0">
+                  <span className="text-xs text-slate-400 block font-medium">Final Amount</span>
+                  <span className="text-2xl font-black text-emerald-700">KSh {finalAmount}</span>
+                </div>
               </div>
-              <div className="text-right shrink-0">
-                <span className="text-xs text-slate-400 block font-medium">Price</span>
-                <span className="text-lg font-black text-slate-900">{selectedPaper.price}</span>
-              </div>
+
+              {/* Specific breakdown for page-based purchases */}
+              {purchaseType === 'pages' ? (
+                <div className="p-3.5 rounded-xl bg-emerald-50/70 border border-emerald-200 text-xs space-y-1.5">
+                  <div className="flex items-center justify-between text-slate-700">
+                    <span className="font-semibold">Selected Page Count:</span>
+                    <span className="font-black text-emerald-950">{pageQuantity} Pages (Last N Pages)</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-2 text-slate-700">
+                    <span className="font-semibold shrink-0">Purchased Page Span:</span>
+                    <span className="font-mono font-bold text-emerald-900 text-right break-all">
+                      [{lastNPages.join(', ')}]
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-slate-600 pt-1 border-t border-emerald-200/80">
+                    <span>Pricing Breakdown:</span>
+                    <span className="font-semibold text-slate-800">{pagesPricing.breakdown}</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-600 flex items-center justify-between">
+                  <span>Scope of Access:</span>
+                  <span className="font-bold text-slate-900">Full Official Examination Document</span>
+                </div>
+              )}
             </div>
 
             {/* AUTOMATED M-PESA PAYMENT FORM */}
@@ -1248,7 +1434,7 @@ export const SearchPaperWorkflow: React.FC<SearchPaperWorkflowProps> = ({
                     <span>Sending M-Pesa Prompt...</span>
                   </>
                 ) : (
-                  <span>PAY {String(selectedPaper.price).startsWith('KSh') ? selectedPaper.price : `KSh ${selectedPaper.price}`} WITH M-PESA</span>
+                  <span>PAY KSh {finalAmount} WITH M-PESA</span>
                 )}
               </button>
 

@@ -11,6 +11,197 @@ export interface EmailResult {
   success: boolean;
   status: 'EMAIL SENT' | 'EMAIL FAILED' | 'EMAIL NOT CONFIGURED';
   error?: string;
+  messageId?: string;
+  response?: string;
+}
+
+export interface SmtpConfigDetails {
+  smtpUser?: string;
+  smtpPassword?: string;
+  host: string;
+  port: number;
+  secure: boolean;
+  userConfigured: boolean;
+  passwordConfigured: boolean;
+  userDomain?: string;
+  passwordLength: number;
+}
+
+export interface SmtpDiagnosticResult {
+  configured: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  userConfigured: boolean;
+  passwordConfigured: boolean;
+  userDomain?: string;
+  passwordLength: number;
+  verified: boolean;
+  message?: string;
+  error?: string;
+  errorCode?: string;
+  response?: string;
+}
+
+/**
+ * Resolves normalized SMTP configuration from environment variables,
+ * supporting standard aliases (e.g. SMTP_USER, EMAIL_USER, GMAIL_USER)
+ * and safely trimming whitespace/quotes.
+ */
+export function getSmtpConfig(): SmtpConfigDetails {
+  const rawUser = (process.env.SMTP_USER || process.env.EMAIL_USER || process.env.GMAIL_USER);
+  const rawPassword = (process.env.SMTP_PASSWORD || process.env.SMTP_PASS || process.env.EMAIL_PASS || process.env.GMAIL_APP_PASSWORD);
+  const rawHost = (process.env.SMTP_HOST || process.env.EMAIL_HOST || 'smtp.gmail.com');
+  const rawPort = (process.env.SMTP_PORT || process.env.EMAIL_PORT || '587');
+  const rawSecure = process.env.SMTP_SECURE;
+
+  const smtpUser = rawUser ? rawUser.trim().replace(/^["']|["']$/g, '') : undefined;
+  const smtpPassword = rawPassword ? rawPassword.trim().replace(/^["']|["']$/g, '') : undefined;
+  const host = rawHost.trim().replace(/^["']|["']$/g, '') || 'smtp.gmail.com';
+  const port = parseInt(rawPort.trim().replace(/^["']|["']$/g, ''), 10) || 587;
+
+  // Port 465 requires direct SSL (secure: true).
+  // Port 587 uses STARTTLS (secure: false).
+  // If SMTP_SECURE is explicitly specified, respect it; otherwise derive from port.
+  let secure = port === 465;
+  if (rawSecure !== undefined) {
+    const trimmedSecure = rawSecure.trim().replace(/^["']|["']$/g, '').toLowerCase();
+    if (trimmedSecure === 'true') {
+      secure = true;
+    } else if (trimmedSecure === 'false') {
+      secure = false;
+    }
+  }
+
+  const userConfigured = Boolean(smtpUser && smtpUser.length > 0);
+  const passwordConfigured = Boolean(smtpPassword && smtpPassword.length > 0);
+  const userDomain = smtpUser && smtpUser.includes('@') ? smtpUser.split('@')[1] : undefined;
+  const passwordLength = smtpPassword ? smtpPassword.length : 0;
+
+  return {
+    smtpUser,
+    smtpPassword,
+    host,
+    port,
+    secure,
+    userConfigured,
+    passwordConfigured,
+    userDomain,
+    passwordLength,
+  };
+}
+
+/**
+ * Creates a Nodemailer transport instance using the resolved configuration.
+ */
+export function createSmtpTransporter() {
+  const { smtpUser, smtpPassword, host, port, secure, userConfigured, passwordConfigured } = getSmtpConfig();
+
+  if (!userConfigured || !passwordConfigured || !smtpUser || !smtpPassword) {
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: {
+      user: smtpUser,
+      pass: smtpPassword,
+    },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
+  });
+}
+
+/**
+ * Verifies SMTP server connectivity and credentials without sending an email.
+ * Never logs or returns secret values.
+ */
+export async function verifySmtpConnection(): Promise<SmtpDiagnosticResult> {
+  const config = getSmtpConfig();
+  const { host, port, secure, userConfigured, passwordConfigured, userDomain, passwordLength } = config;
+
+  if (!userConfigured || !passwordConfigured) {
+    return {
+      configured: false,
+      host,
+      port,
+      secure,
+      userConfigured,
+      passwordConfigured,
+      userDomain,
+      passwordLength,
+      verified: false,
+      error: 'SMTP credentials (SMTP_USER / SMTP_PASSWORD) are not configured in environment.',
+    };
+  }
+
+  const transporter = createSmtpTransporter();
+  if (!transporter) {
+    return {
+      configured: false,
+      host,
+      port,
+      secure,
+      userConfigured,
+      passwordConfigured,
+      userDomain,
+      passwordLength,
+      verified: false,
+      error: 'Failed to initialize SMTP transporter with provided configuration.',
+    };
+  }
+
+  try {
+    await transporter.verify();
+    console.log('[SMTP DIAGNOSTIC SUCCESS]', {
+      host,
+      port,
+      secure,
+      user_configured: userConfigured,
+      user_domain: userDomain,
+      password_length: passwordLength,
+    });
+    return {
+      configured: true,
+      host,
+      port,
+      secure,
+      userConfigured,
+      passwordConfigured,
+      userDomain,
+      passwordLength,
+      verified: true,
+      message: 'SMTP transport connection and authentication verified successfully.',
+    };
+  } catch (err: any) {
+    // SECURITY: Never log the password
+    console.error('[SMTP DIAGNOSTIC ERROR]', {
+      host,
+      port,
+      secure,
+      errorCode: err.code,
+      errorMessage: err.message,
+      responseCode: err.responseCode,
+      command: err.command,
+    });
+    return {
+      configured: true,
+      host,
+      port,
+      secure,
+      userConfigured,
+      passwordConfigured,
+      userDomain,
+      passwordLength,
+      verified: false,
+      error: err.message || 'SMTP verification failed.',
+      errorCode: err.code,
+      response: err.response,
+    };
+  }
 }
 
 export async function sendActivationEmail(params: SendActivationEmailParams): Promise<EmailResult> {
@@ -24,12 +215,17 @@ export async function sendActivationEmail(params: SendActivationEmailParams): Pr
     };
   }
 
-  const smtpUser = process.env.SMTP_USER?.trim();
-  const smtpPassword = process.env.SMTP_PASSWORD?.trim();
+  const config = getSmtpConfig();
+  const { smtpUser, host, port, secure, userConfigured, passwordConfigured, userDomain, passwordLength } = config;
 
   // If SMTP credentials are not configured
-  if (!smtpUser || !smtpPassword) {
-    console.warn('[EMAIL] SMTP credentials (SMTP_USER / SMTP_PASSWORD) not configured. Activation email skipped.');
+  if (!userConfigured || !passwordConfigured || !smtpUser) {
+    console.warn('[EMAIL] SMTP credentials (SMTP_USER / SMTP_PASSWORD) not configured. Activation email skipped.', {
+      user_configured: userConfigured,
+      password_configured: passwordConfigured,
+      host,
+      port,
+    });
     return {
       success: false,
       status: 'EMAIL NOT CONFIGURED',
@@ -37,24 +233,16 @@ export async function sendActivationEmail(params: SendActivationEmailParams): Pr
     };
   }
 
+  const transporter = createSmtpTransporter();
+  if (!transporter) {
+    return {
+      success: false,
+      status: 'EMAIL FAILED',
+      error: 'Failed to initialize SMTP transporter.',
+    };
+  }
+
   try {
-    const host = process.env.SMTP_HOST || 'smtp.gmail.com';
-    const port = parseInt(process.env.SMTP_PORT || '587', 10);
-    const secure = process.env.SMTP_SECURE === 'true' || port === 465;
-
-    const transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure,
-      auth: {
-        user: smtpUser,
-        pass: smtpPassword,
-      },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 15000,
-    });
-
     const displayName = firstName ? firstName.trim() : 'Valued Student';
 
     const textContent = `Hello ${displayName},
@@ -126,7 +314,9 @@ Godrery Publishers`;
 </body>
 </html>`;
 
-    await transporter.sendMail({
+    console.log(`[EMAIL DISPATCH] Dispatching document activation email to ${to} via ${host}:${port} (secure=${secure})`);
+
+    const info = await transporter.sendMail({
       from: `"Godrery Publishers" <${smtpUser}>`,
       to,
       subject: 'Your Godrery Publishers document is ready',
@@ -134,14 +324,21 @@ Godrery Publishers`;
       html: htmlContent,
     });
 
-    console.log(`[EMAIL] Successfully sent activation email to: ${to}`);
+    console.log(`[EMAIL SUCCESS] SMTP relay accepted email for delivery to ${to}. MessageId: ${info.messageId}`);
     return {
       success: true,
       status: 'EMAIL SENT',
+      messageId: info.messageId,
+      response: info.response,
     };
   } catch (err: any) {
     // SECURITY: Never log process.env.SMTP_PASSWORD
-    console.error(`[EMAIL ERROR] Failed to send email to ${to}:`, err.message || err);
+    console.error(`[EMAIL ERROR] Failed to send email to ${to}:`, {
+      code: err.code,
+      message: err.message,
+      command: err.command,
+      responseCode: err.responseCode,
+    });
     return {
       success: false,
       status: 'EMAIL FAILED',
@@ -149,3 +346,4 @@ Godrery Publishers`;
     };
   }
 }
+

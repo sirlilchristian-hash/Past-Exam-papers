@@ -1,7 +1,6 @@
 import React from 'react';
 import {
   LayoutDashboard,
-  KeyRound,
   FileText,
   CreditCard,
   BookOpen,
@@ -22,7 +21,6 @@ import { AdminSection } from './adminTypes';
 interface AdminSidebarProps {
   activeSection: AdminSection;
   onSelectSection: (section: AdminSection) => void;
-  pendingActivationsCount: number;
   pendingDeviceRequestsCount: number;
   adminAccountId?: string;
   adminRole: string;
@@ -36,7 +34,6 @@ interface AdminSidebarProps {
 export const AdminSidebar: React.FC<AdminSidebarProps> = ({
   activeSection,
   onSelectSection,
-  pendingActivationsCount,
   pendingDeviceRequestsCount,
   adminAccountId = 'Superadmin',
   adminRole,
@@ -157,7 +154,6 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({
             <div className="px-3 py-1 text-[10px] font-bold tracking-wider text-slate-500 uppercase">
               Sales
             </div>
-            {renderNavButton('activate_code', 'Activate Code', KeyRound, pendingActivationsCount)}
             {renderNavButton('orders', 'Orders', FileText)}
             {renderNavButton('payments', 'Payments', CreditCard)}
           </div>

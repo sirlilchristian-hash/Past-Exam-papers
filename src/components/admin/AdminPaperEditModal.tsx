@@ -51,6 +51,7 @@ export const AdminPaperEditModal: React.FC<AdminPaperEditModalProps> = ({
   const [formTouched, setFormTouched] = useState<{ [key: string]: boolean }>({});
   const [hasAttemptedSubmit, setHasAttemptedSubmit] = useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string>('');
+  const [formEligiblePages, setFormEligiblePages] = useState<number[]>([]);
 
   useEffect(() => {
     if (editingPaper) {
@@ -60,6 +61,7 @@ export const AdminPaperEditModal: React.FC<AdminPaperEditModalProps> = ({
       setFormPrice(cleanPrice || '50');
       setFormStatus(editingPaper.status || 'available');
       setFormFilePath(editingPaper.file_path || '');
+      setFormEligiblePages(editingPaper.eligible_pages || []);
       setSelectedFile(null);
       setUploadedFileName('');
       setUploadedFileSize('');
@@ -72,6 +74,7 @@ export const AdminPaperEditModal: React.FC<AdminPaperEditModalProps> = ({
       setFormPrice(defaultPrice.replace(/[^\d]/g, '') || '50');
       setFormStatus('available');
       setFormFilePath('');
+      setFormEligiblePages([]);
       setSelectedFile(null);
       setUploadedFileName('');
       setUploadedFileSize('');
@@ -235,6 +238,7 @@ export const AdminPaperEditModal: React.FC<AdminPaperEditModalProps> = ({
     if (selectedFile) {
       formData.append('pdfFile', selectedFile);
     }
+    formData.append('eligible_pages', JSON.stringify(formEligiblePages));
 
     const savedPaperMeta: Paper = {
       id: editingPaper?.id || `paper-${Date.now()}`,
@@ -331,13 +335,21 @@ export const AdminPaperEditModal: React.FC<AdminPaperEditModalProps> = ({
 
             {/* Current Document Path Display */}
             {editingPaper && (
-              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1">
-                <div className="text-[11px] font-semibold text-slate-400">Current document</div>
-                <div className="font-mono text-xs text-white break-all flex items-center gap-2">
-                  <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span>{formFilePath || editingPaper.file_path || 'None'}</span>
+              <>
+                <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1">
+                  <div className="text-[11px] font-semibold text-slate-400">Current document</div>
+                  <div className="font-mono text-xs text-white break-all flex items-center gap-2">
+                    <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span>{formFilePath || editingPaper.file_path || 'None'}</span>
+                  </div>
                 </div>
-              </div>
+                <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-slate-400">Total Page Count (Server-Detected)</span>
+                  <span className="font-mono font-bold text-emerald-400 text-xs">
+                    {editingPaper.total_pages || (Array.isArray(editingPaper.eligible_pages) ? editingPaper.eligible_pages.length : 12)} pages
+                  </span>
+                </div>
+              </>
             )}
 
             {/* Segmented Control: Replace vs Merge (Only for existing papers) */}
@@ -616,6 +628,50 @@ export const AdminPaperEditModal: React.FC<AdminPaperEditModalProps> = ({
                 <option value="available">available (Active)</option>
                 <option value="unavailable">unavailable (Draft)</option>
               </select>
+            </div>
+          </div>
+
+          {/* Eligible Pages */}
+          <div className="pt-2 border-t border-slate-800 space-y-2">
+            <label className="block font-bold text-slate-300">Eligible Pages (in order)</label>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                placeholder="Add page number"
+                className="w-full px-3.5 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white focus:outline-none focus:border-[#00D26A]"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const val = parseInt((e.target as HTMLInputElement).value);
+                    if (!isNaN(val) && val > 0 && !formEligiblePages.includes(val)) {
+                      setFormEligiblePages([...formEligiblePages, val]);
+                      (e.target as HTMLInputElement).value = '';
+                    }
+                  }
+                }}
+              />
+            </div>
+            <div className="space-y-1 max-h-40 overflow-y-auto">
+              {formEligiblePages.map((page, index) => (
+                <div key={page} className="px-2 py-1 bg-slate-800 rounded-lg text-white text-xs flex items-center justify-between">
+                  <span>Page {page}</span>
+                  <div className="flex items-center gap-1">
+                    <button type="button" disabled={index === 0} onClick={() => {
+                        const newPages = [...formEligiblePages];
+                        [newPages[index], newPages[index - 1]] = [newPages[index - 1], newPages[index]];
+                        setFormEligiblePages(newPages);
+                    }} className="disabled:opacity-50">↑</button>
+                    <button type="button" disabled={index === formEligiblePages.length - 1} onClick={() => {
+                        const newPages = [...formEligiblePages];
+                        [newPages[index], newPages[index + 1]] = [newPages[index + 1], newPages[index]];
+                        setFormEligiblePages(newPages);
+                    }} className="disabled:opacity-50">↓</button>
+                    <button type="button" onClick={() => setFormEligiblePages(formEligiblePages.filter((_, i) => i !== index))}>
+                      <X className="w-3 h-3 text-rose-400" />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
 

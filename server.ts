@@ -6,8 +6,9 @@ import { GoogleGenAI } from "@google/genai";
 import jwt from "jsonwebtoken";
 
 import { initReceiptGenerator, generateAndMergeReceipt } from './receiptGenerator.ts';
-import { sendActivationEmail } from './emailService.ts';
+import { sendActivationEmail, verifySmtpConnection, createSmtpTransporter, getSmtpConfig } from './emailService.ts';
 import { PDFDocument } from 'pdf-lib';
+import { calculateAuthoritativePagesPrice } from './src/lib/pricingCalculator.ts';
 
 import bcrypt from "bcryptjs";
 import dotenv from "dotenv";
@@ -136,6 +137,21 @@ initReceiptGenerator(supabaseAdmin);
 // Increase body limit for base64 image uploads
 app.use(express.json({ limit: '50mb' }));
 
+async function generatePageSpecificPDF(
+  fullPdfBuffer: Buffer, 
+  pagesToKeep: number[]
+): Promise<Uint8Array> {
+  const doc = await PDFDocument.load(fullPdfBuffer);
+  const newDoc = await PDFDocument.create();
+  
+  // pagesToKeep are 1-based, PDFDocument is 0-based
+  const indices = pagesToKeep.map(p => p - 1);
+  const copiedPages = await newDoc.copyPages(doc, indices);
+  copiedPages.forEach((p) => newDoc.addPage(p));
+  
+  return await newDoc.save();
+}
+
 let aiClient: GoogleGenAI | null = null;
 function getAiClient() {
   if (!aiClient) {
@@ -185,6 +201,132 @@ function requireRole(allowedRoles: string[]) {
     }
     next();
   };
+}
+
+// Payment Mode Configuration Helper
+// Supported values: 'simulation' | 'daraja'
+// Fail-safe fallback: If PAYMENT_MODE is not set, checks ENABLE_PAYMENT_SIMULATION for backward compatibility
+export function getPaymentMode(): { mode: 'simulation' | 'daraja' | 'invalid'; isSimulation: boolean; isDaraja: boolean } {
+  const envMode = process.env.PAYMENT_MODE?.trim().toLowerCase();
+  if (envMode === 'simulation') {
+    return { mode: 'simulation', isSimulation: true, isDaraja: false };
+  }
+  if (envMode === 'daraja') {
+    return { mode: 'daraja', isSimulation: false, isDaraja: true };
+  }
+  if (!envMode) {
+    if (process.env.ENABLE_PAYMENT_SIMULATION === 'true') {
+      return { mode: 'simulation', isSimulation: true, isDaraja: false };
+    }
+    // Default safe production mode is daraja
+    return { mode: 'daraja', isSimulation: false, isDaraja: true };
+  }
+  return { mode: 'invalid', isSimulation: false, isDaraja: false };
+}
+
+// Authorization check for administrator simulation and diagnostic tools
+// Rejects unauthorized access; never permits ordinary public customers to obtain free orders.
+export function isAuthorizedAdminOrSimulationSecret(req: express.Request): boolean {
+  // 1. Check Bearer JWT
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith("Bearer ")) {
+    try {
+      const token = authHeader.split(" ")[1];
+      jwt.verify(token, JWT_SECRET);
+      return true;
+    } catch {
+      // Invalid JWT
+    }
+  }
+
+  // 2. Check dedicated SIMULATION_SECRET
+  const configuredSimSecret = process.env.SIMULATION_SECRET?.trim();
+  const rawSimHeader = req.headers['x-simulation-secret'] || req.body?.simulationSecret;
+  if (
+    configuredSimSecret &&
+    configuredSimSecret.length > 0 &&
+    typeof rawSimHeader === 'string' &&
+    rawSimHeader.trim().length > 0 &&
+    rawSimHeader.trim() === configuredSimSecret
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+// Persisted registry for simulated payment idempotency keys (survives retries and restarts in memory)
+export const simulatedIdempotencyRegistry = new Map<string, {
+  orderId: string;
+  paymentId?: string;
+  mpesaReceipt: string;
+  createdAt: number;
+}>();
+
+// Customer checkout token generator with expiration (default 2 hours) using server ENCRYPTION_KEY
+export function generateCheckoutToken(orderId: string, ttlSeconds = 7200): string {
+  const expiry = Date.now() + (ttlSeconds * 1000);
+  const data = `checkout:${orderId}:${expiry}`;
+  const sig = crypto.createHmac('sha256', ENCRYPTION_KEY).update(data).digest('hex');
+  return `${expiry}.${sig}`;
+}
+
+export function verifyCheckoutToken(orderId: string, token?: string | null): boolean {
+  if (!token || !orderId) return false;
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 2) return false;
+    const expiryStr = parts[0];
+    const sig = parts[1];
+    const expiry = Number(expiryStr);
+    if (isNaN(expiry) || Date.now() > expiry) {
+      return false; // Expired or invalid expiry
+    }
+    const data = `checkout:${orderId}:${expiryStr}`;
+    const expectedSig = crypto.createHmac('sha256', ENCRYPTION_KEY).update(data).digest('hex');
+    if (sig.length !== expectedSig.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig));
+  } catch {
+    return false;
+  }
+}
+
+export function getCookie(req: express.Request, name: string): string | null {
+  const cookies = req.headers.cookie || '';
+  const match = cookies.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+export function setCheckoutCookie(res: express.Response, orderId: string, checkoutToken: string, ttlSeconds = 7200) {
+  const secureFlag = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  const cookieValue = `checkout_token_${orderId}=${encodeURIComponent(checkoutToken)}; HttpOnly; Path=/; Max-Age=${ttlSeconds}; SameSite=Lax${secureFlag}`;
+  res.append('Set-Cookie', cookieValue);
+}
+
+export function isCheckoutSessionAuthorized(req: express.Request, orderId: string): boolean {
+  if (!orderId) return false;
+  // 1. Check admin or simulation secret authorization
+  if (isAuthorizedAdminOrSimulationSecret(req)) return true;
+
+  // 2. Check query param, body param, or header
+  const tokenCandidate = (
+    req.query.checkoutToken ||
+    req.query.token ||
+    req.headers['x-checkout-token'] ||
+    (req.body && (req.body.checkoutToken || req.body.checkout_token))
+  ) as string | undefined;
+
+  if (tokenCandidate && verifyCheckoutToken(orderId, tokenCandidate)) {
+    return true;
+  }
+
+  // 3. Check cookie
+  const cookieVal = getCookie(req, `checkout_token_${orderId}`) || getCookie(req, 'checkout_token');
+  if (cookieVal && verifyCheckoutToken(orderId, cookieVal)) {
+    return true;
+  }
+
+  return false;
 }
 
 // Admin login endpoint
@@ -339,7 +481,7 @@ app.patch("/api/admin/users/:accountId", requireAdmin, requireRole(["super_admin
   const { accountId } = req.params;
   const { role, status } = req.body;
   
-  if (accountId === res.locals.admin.account_id) {
+  if (accountId === res.locals.admin.account_id || accountId === res.locals.admin.id) {
     return res.status(403).json({ error: "Cannot modify your own role or status." });
   }
   if (role && role === 'super_admin') {
@@ -357,7 +499,7 @@ app.patch("/api/admin/users/:accountId", requireAdmin, requireRole(["super_admin
     const { data, error } = await supabaseAdmin
       .from("admin_users")
       .update(updates)
-      .eq("account_id", accountId)
+      .or(`account_id.eq.${accountId},id.eq.${accountId}`)
       .select("id, account_id, role, status, created_at")
       .single();
     if (error) throw error;
@@ -372,7 +514,7 @@ app.post("/api/admin/users/:accountId/reset-password", requireAdmin, requireRole
   const { accountId } = req.params;
   const { newPassword } = req.body;
   
-  if (accountId === res.locals.admin.account_id) {
+  if (accountId === res.locals.admin.account_id || accountId === res.locals.admin.id) {
     return res.status(403).json({ error: "Cannot reset your own password here. Use the Change Password function." });
   }
   if (!newPassword || newPassword.length < 8) {
@@ -384,7 +526,7 @@ app.post("/api/admin/users/:accountId/reset-password", requireAdmin, requireRole
     const { error } = await supabaseAdmin
       .from("admin_users")
       .update({ password_hash })
-      .eq("account_id", accountId);
+      .or(`account_id.eq.${accountId},id.eq.${accountId}`);
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
@@ -479,6 +621,22 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
       return res.status(400).json({ error: "Invalid status. Supported values are 'available' or 'unavailable'." });
     }
 
+    // Validate eligible_pages
+    let eligiblePages: number[] = [];
+    if (req.body.eligible_pages) {
+      try {
+        eligiblePages = JSON.parse(req.body.eligible_pages);
+        if (!Array.isArray(eligiblePages) || eligiblePages.some(p => typeof p !== 'number' || p <= 0 || !Number.isInteger(p))) {
+           return res.status(400).json({ error: "eligible_pages must be an array of unique positive integers." });
+        }
+        if (new Set(eligiblePages).size !== eligiblePages.length) {
+           return res.status(400).json({ error: "eligible_pages must contain unique page numbers." });
+        }
+      } catch (e) {
+         return res.status(400).json({ error: "Invalid eligible_pages format." });
+      }
+    }
+
     const file = req.file;
 
     // Requirement: PDF file required for new paper creation
@@ -486,25 +644,35 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
       return res.status(400).json({ error: "PDF file is required when uploading a new paper." });
     }
 
+    let truePageCount = 12;
     if (file) {
-      // Extension validation
+      try {
+        const parsedPdf = await PDFDocument.load(file.buffer);
+        truePageCount = parsedPdf.getPageCount();
+        if (truePageCount <= 0) {
+          return res.status(400).json({ error: "Invalid PDF: document contains 0 pages." });
+        }
+        if (eligiblePages.length > 0 && eligiblePages.some(p => p > truePageCount)) {
+          return res.status(400).json({ error: `eligible_pages contains page numbers exceeding document page count of ${truePageCount}.` });
+        }
+      } catch (pdfErr: any) {
+        return res.status(400).json({ error: `Invalid, corrupt, or unreadable PDF: ${pdfErr.message || 'Parse error'}` });
+      }
+
       const originalName = file.originalname || '';
       if (!originalName.toLowerCase().endsWith('.pdf')) {
         return res.status(400).json({ error: "Invalid file format. Only .pdf files are permitted." });
       }
 
-      // MIME type validation
       if (file.mimetype !== 'application/pdf') {
         return res.status(400).json({ error: "Invalid MIME type. File type must be application/pdf." });
       }
 
-      // Magic bytes signature validation (%PDF-)
       const magicBytes = file.buffer.slice(0, 5).toString('utf-8');
       if (!magicBytes.startsWith('%PDF-')) {
         return res.status(400).json({ error: "Invalid PDF file content. File failed signature verification." });
       }
 
-      // File size validation (25MB)
       if (file.size > 25 * 1024 * 1024) {
         return res.status(400).json({ error: "File size exceeds the 25 MB limit." });
       }
@@ -543,6 +711,8 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
             price: numericPrice,
             status: status,
             file_path: storagePath,
+            eligible_pages: eligiblePages.length > 0 ? eligiblePages : null,
+            total_pages: truePageCount,
           },
         ])
         .select()
@@ -656,6 +826,7 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
               price: numericPrice,
               status: status,
               file_path: mergedStoragePath,
+              eligible_pages: eligiblePages.length > 0 ? eligiblePages : null,
             })
             .eq("id", paperId)
             .select()
@@ -721,6 +892,7 @@ app.post("/api/papers/upload", requireAdmin, requireRole(["super_admin", "conten
             price: numericPrice,
             status: status,
             file_path: newStoragePath,
+            total_pages: truePageCount,
           })
           .eq("id", paperId)
           .select()
@@ -861,6 +1033,7 @@ app.post("/api/papers/merge", requireAdmin, requireRole(["super_admin", "content
 
     // 2. Validate & Merge PDFs: existing PDF pages first, new uploaded PDF pages second
     let mergedPdfBytes: Uint8Array;
+    let mergedTotalPages = 12;
     try {
       const existingDoc = await PDFDocument.load(existingBytes);
       const newDoc = await PDFDocument.load(newBytes);
@@ -873,6 +1046,8 @@ app.post("/api/papers/merge", requireAdmin, requireRole(["super_admin", "content
       newPages.forEach((p) => mergedDoc.addPage(p));
 
       mergedPdfBytes = await mergedDoc.save();
+      const mergedPdfDocObj = await PDFDocument.load(mergedPdfBytes);
+      mergedTotalPages = mergedPdfDocObj.getPageCount();
     } catch (mergeErr: any) {
       console.error("PDF merge processing error:", mergeErr);
       return res.status(400).json({
@@ -897,10 +1072,11 @@ app.post("/api/papers/merge", requireAdmin, requireRole(["super_admin", "content
       return res.status(500).json({ error: "Failed to store merged PDF. Original document preserved." });
     }
 
-    // 4. Update database record with new merged file_path
+    // 4. Update database record with new merged file_path and total_pages
     const numericPrice = rawPrice ? parseInt(rawPrice.replace(/\D/g, '') || '0', 10) : existingPaper.price;
     const updatePayload: any = {
       file_path: mergedStoragePath,
+      total_pages: mergedTotalPages,
     };
     if (unitCode) updatePayload.unit_code = unitCode;
     if (paperTitle) updatePayload.paper_title = paperTitle;
@@ -972,6 +1148,7 @@ app.get("/api/papers", async (req, res) => {
         isAvailable: p.status === 'available',
         file_path: p.file_path,
         fileName: p.file_path,
+        eligible_pages: Array.isArray(p.eligible_pages) && p.eligible_pages.length >= 6 ? p.eligible_pages : Array.from({ length: 12 }, (_, i) => i + 1),
         created_at: p.created_at,
         createdAt: p.created_at,
       }));
@@ -1120,6 +1297,7 @@ app.get("/api/papers/:id", async (req, res) => {
       isAvailable: p.status === 'available',
       file_path: p.file_path,
       fileName: p.file_path,
+      eligible_pages: Array.isArray(p.eligible_pages) && p.eligible_pages.length >= 6 ? p.eligible_pages : Array.from({ length: 12 }, (_, i) => i + 1),
       created_at: p.created_at,
       createdAt: p.created_at,
     };
@@ -1416,7 +1594,7 @@ app.post("/api/orders/whatsapp", async (req, res) => {
 
     if (orderErr) throw orderErr;
 
-    return res.json({ success: true, orderId: newOrder.id, accessToken: generateAccessToken(newOrder.id) });
+    return res.json({ success: true, orderId: newOrder.id, status: 'pending' });
   } catch (err) {
     console.error("WhatsApp order creation error:", err);
     return res.status(500).json({ success: false, error: "Internal server error." });
@@ -1457,7 +1635,29 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
     });
   }
 
-  // 3. Check Server M-Pesa Daraja Credentials early to avoid DB writes if missing
+  // 3. Payment Mode & Gateway Validation
+  const paymentMode = getPaymentMode();
+
+  if (paymentMode.mode === 'invalid') {
+    return res.status(500).json({
+      success: false,
+      error: "Invalid PAYMENT_MODE configuration. Allowed values are 'simulation' or 'daraja'."
+    });
+  }
+
+  // Security Gate: In simulation mode, public checkout cannot obtain free orders.
+  // Simulation is strictly restricted to authenticated administrators.
+  const isSimulationAuthorized = isAuthorizedAdminOrSimulationSecret(req);
+
+  if (paymentMode.isSimulation && !isSimulationAuthorized) {
+    return res.status(403).json({
+      success: false,
+      outcome: "definite_failure",
+      error: "Payment gateway is currently in controlled simulation test mode. Live M-Pesa payments are paused and simulation is strictly restricted to authorized administrators. For authorized testing, use POST /api/admin/simulate-successful-payment."
+    });
+  }
+
+  // Check Server M-Pesa Daraja Credentials for live operation
   const consumerKey = process.env.MPESA_CONSUMER_KEY;
   const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
   const mpesaEnv = (process.env.MPESA_ENV || 'sandbox').toLowerCase();
@@ -1471,9 +1671,12 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
   const passkey = isSandbox ? SANDBOX_PASSKEY : process.env.MPESA_PASSKEY;
   const callbackUrl = process.env.MPESA_CALLBACK_URL;
 
-  if (!consumerKey || !consumerSecret || !callbackUrl || !shortcode || !passkey) {
+  const hasDarajaCredentials = Boolean(consumerKey && consumerSecret && callbackUrl && shortcode && passkey);
+
+  if (paymentMode.isDaraja && !hasDarajaCredentials) {
     return res.status(500).json({
       success: false,
+      outcome: "definite_failure",
       error: "M-Pesa configuration is incomplete. Missing required credentials for the active environment."
     });
   }
@@ -1487,17 +1690,54 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       .single();
 
     if (paperErr || !dbPaper) {
-      return res.status(404).json({ success: false, error: "The requested paper record was not found in the catalog." });
+      return res.status(404).json({ success: false, outcome: "definite_failure", error: "The requested paper record was not found in the catalog." });
     }
 
     if (dbPaper.status?.toLowerCase() !== 'available') {
-      return res.status(400).json({ success: false, error: "This paper is currently unavailable for purchase." });
+      return res.status(400).json({ success: false, outcome: "definite_failure", error: "This paper is currently unavailable for purchase." });
     }
 
-    const priceNumeric = Number(dbPaper.price);
-    if (isNaN(priceNumeric) || priceNumeric <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid paper price configuration in catalog." });
+    let purchasedPages: number[] | null = null;
+    let pageQuantity: number | null = null;
+    let unitPrice: number | null = null;
+    let orderAmount = Number(dbPaper.price);
+
+    const purchaseType = (req.body.purchase_type || (req.body.selected_pages || req.body.page_quantity ? 'pages' : 'full')).toLowerCase();
+
+    if (purchaseType === 'pages') {
+      const totalPages = Number(dbPaper.total_pages) || (Array.isArray(dbPaper.eligible_pages) ? dbPaper.eligible_pages.length : 12);
+      const qty = parseInt(req.body.page_quantity || 6, 10);
+      if (isNaN(qty) || qty < 6 || qty > totalPages) {
+        return res.status(400).json({
+          success: false,
+          outcome: "definite_failure",
+          error: `Invalid page quantity requested. Must be between 6 and ${totalPages}.`
+        });
+      }
+
+      // Deterministic last-N-pages selection: [totalPages - qty + 1, ..., totalPages]
+      const targetPages = Array.from({ length: qty }, (_, i) => totalPages - qty + i + 1);
+
+      const pricingResult = calculateAuthoritativePagesPrice(dbPaper, targetPages);
+      if (!pricingResult.isValid) {
+        return res.status(400).json({
+          success: false,
+          outcome: "definite_failure",
+          error: pricingResult.validationError || "Invalid page selection or pricing configuration."
+        });
+      }
+
+      purchasedPages = targetPages;
+      pageQuantity = targetPages.length;
+      orderAmount = pricingResult.totalAmount;
+      unitPrice = Math.round((orderAmount / pageQuantity) * 100) / 100;
+    } else {
+      if (isNaN(orderAmount) || orderAmount <= 0) {
+        return res.status(400).json({ success: false, outcome: "definite_failure", error: "Invalid paper price configuration in catalog." });
+      }
     }
+
+    const priceNumeric = orderAmount;
 
     // 4. Customer management: Find or create customer record in public.customers
     // IMPORTANT: customers.phone stores ONLY the normalized phone number, never the email.
@@ -1510,17 +1750,15 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
 
     if (existingCustomer?.id) {
       customerId = existingCustomer.id;
-      // Update names, and try setting email if dedicated column exists in schema
-      try {
-        await supabaseAdmin
-          .from("customers")
-          .update({ first_name: targetFirstName, second_name: targetSecondName, email: targetEmail })
-          .eq("id", customerId);
-      } catch {
-        await supabaseAdmin
-          .from("customers")
-          .update({ first_name: targetFirstName, second_name: targetSecondName })
-          .eq("id", customerId);
+      // Update existing customer's names to match current purchase request
+      const { error: updateCustErr } = await supabaseAdmin
+        .from("customers")
+        .update({ first_name: targetFirstName, second_name: targetSecondName })
+        .eq("id", customerId);
+
+      if (updateCustErr) {
+        console.error("Failed to update customer names:", updateCustErr);
+        return res.status(500).json({ success: false, outcome: "definite_failure", error: "Failed to update existing customer record." });
       }
     } else {
       // Try inserting with email first
@@ -1555,7 +1793,7 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
 
         if (createCustErr || !newCustomer) {
           console.error("Customer creation error:", createCustErr);
-          return res.status(500).json({ success: false, error: "Failed to initialize customer record." });
+          return res.status(500).json({ success: false, outcome: "definite_failure", error: "Failed to initialize customer record." });
         }
         customerId = newCustomer.id;
       }
@@ -1567,15 +1805,19 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       .insert({
         customer_id: customerId,
         paper_id: targetPaperId,
-        amount: priceNumeric,
-        status: 'pending'
+        amount: orderAmount,
+        status: 'pending',
+        purchased_pages: purchasedPages,
+        page_quantity: pageQuantity,
+        unit_price: unitPrice,
+        total_amount: orderAmount
       })
       .select("id")
       .single();
 
     if (orderErr || !newOrder) {
       console.error("Order creation error:", orderErr);
-      return res.status(500).json({ success: false, error: "Failed to initialize order record." });
+      return res.status(500).json({ success: false, outcome: "definite_failure", error: "Failed to initialize order record." });
     }
     const orderId = newOrder.id;
 
@@ -1588,7 +1830,7 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       .insert({
         order_id: orderId,
         phone: normalizedPhone,
-        amount: priceNumeric,
+        amount: orderAmount,
         status: 'pending',
         mpesa_receipt: null,
         transaction_date: null,
@@ -1602,9 +1844,97 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       console.error("Payment record creation error:", paymentErr);
       // Rollback order
       await supabaseAdmin.from("Orders").delete().eq("id", orderId);
-      return res.status(500).json({ success: false, error: "Failed to initialize payment tracking." });
+      return res.status(500).json({ success: false, outcome: "definite_failure", error: "Failed to initialize payment tracking." });
     }
     const paymentId = newPayment.id;
+
+    // Controlled Payment Simulation Mode:
+    // Only executed if PAYMENT_MODE is simulation AND the request is authorized by admin.
+    // Public requests NEVER reach here.
+    const shouldSimulate = paymentMode.isSimulation && isSimulationAuthorized;
+
+    if (shouldSimulate) {
+      const timestampPart = Date.now().toString(36).toUpperCase();
+      const simReceipt = `SIM${timestampPart}`;
+      const simCheckoutId = `ws_CO_SIM_${Date.now()}`;
+      const simMerchantId = `SIM_MERCHANT_${Date.now()}`;
+
+      // Update payment record to completed
+      await supabaseAdmin
+        .from("payments")
+        .update({
+          status: 'completed',
+          mpesa_receipt: simReceipt,
+          amount: priceNumeric,
+          phone: normalizedPhone,
+          checkout_request_id: simCheckoutId,
+          merchant_request_id: simMerchantId,
+          transaction_date: new Date().toISOString()
+        })
+        .eq("id", paymentId);
+
+      // Update order to paid
+      await supabaseAdmin
+        .from("Orders")
+        .update({ status: 'paid' })
+        .eq("id", orderId);
+
+      console.log(`[SIMULATION SUCCESS] Order ${orderId} & Payment ${paymentId} marked PAID/COMPLETED with receipt ${simReceipt}`);
+
+      // Generate PDF receipt asynchronously
+      generateAndMergeReceipt(orderId).catch(err => {
+        console.error("[SIMULATION RECEIPT ERROR]", err);
+      });
+
+      // Generate secure document access token
+      const accessToken = generateAccessToken(orderId);
+      const openDocumentUrl = getDocumentAccessUrl(req, accessToken);
+
+      // Associate email with orderId and checkoutId
+      saveOrderEmail(orderId, targetEmail);
+      saveOrderEmail(simCheckoutId, targetEmail);
+
+      // Trigger SMTP document activation email using existing Nodemailer email service
+      let emailStatus = 'pending';
+      let emailError: string | null = null;
+      try {
+        console.log(`[SIMULATION] Sending document activation email to: ${targetEmail}`);
+        const emailResult = await sendActivationEmail({
+          to: targetEmail,
+          firstName: targetFirstName,
+          paperTitle: dbPaper.paper_title || 'Purchased Document',
+          openDocumentUrl,
+        });
+        emailStatus = emailResult.status;
+        if (emailResult.error) emailError = emailResult.error;
+        orderEmailStatusMap.set(orderId, {
+          status: emailResult.status,
+          sentAt: new Date().toISOString(),
+          error: emailResult.error,
+        });
+      } catch (mailErr: any) {
+        emailStatus = 'failed';
+        emailError = mailErr?.message || 'Email delivery exception';
+        console.error(`[SIMULATION] Email delivery error:`, mailErr);
+      }
+
+      const checkoutToken = generateCheckoutToken(orderId);
+      setCheckoutCookie(res, orderId, checkoutToken);
+
+      return res.json({
+        success: true,
+        orderId: orderId,
+        checkoutToken: checkoutToken,
+        status: "paid",
+        isPaid: true,
+        mpesaReceipt: simReceipt,
+        accessToken: accessToken,
+        openDocumentUrl: openDocumentUrl,
+        emailStatus,
+        emailError,
+        customerMessage: "Simulated payment processed successfully. Preparing your document access..."
+      });
+    }
 
     // 8. Safaricom Daraja STK Push Execution
     const baseUrl = mpesaEnv === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke';
@@ -1670,7 +2000,7 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
 
     if (stkRes.ok && stkData.ResponseCode === "0") {
       // Safaricom accepted STK Push request
-      
+
       console.log("[M-Pesa STK Push Debug] Safaricom Accepted Request:", {
         ResponseCode: stkData.ResponseCode,
         ResponseDescription: stkData.ResponseDescription,
@@ -1682,23 +2012,51 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
       const checkoutRequestId = stkData.CheckoutRequestID;
       const merchantRequestId = stkData.MerchantRequestID;
 
+      if (!checkoutRequestId || !merchantRequestId) {
+        console.error("[M-Pesa STK Push] Critical failure: Missing identifiers in success response", stkData);
+        return res.status(202).json({
+          success: false,
+          uncertainOutcome: true,
+          outcome: "uncertain",
+          error: "The payment initiation response was malformed. Do not initiate another payment until checking with support."
+        });
+      }
+
       // Update payments table with CheckoutRequestID and MerchantRequestID
-      await supabaseAdmin
+      const { data: updateData, error: updateError } = await supabaseAdmin
         .from("payments")
         .update({
           checkout_request_id: checkoutRequestId,
           merchant_request_id: merchantRequestId
         })
-        .eq("id", paymentId);
+        .eq("id", paymentId)
+        .select("id");
+
+      if (updateError || !updateData || updateData.length !== 1) {
+        console.error("Daraja returned a successful STK response, but identifier persistence failed:", {
+          paymentId,
+          error: updateError?.message || (updateData ? `Unexpected row count: ${updateData.length}` : "No data returned")
+        });
+        return res.status(202).json({
+          success: false,
+          uncertainOutcome: true,
+          outcome: "uncertain",
+          error: "The payment request may have been initiated by Safaricom, but we could not save its reference. Do not initiate another payment until the outcome has been checked. Check your phone for an M-Pesa prompt and contact support if you are charged."
+        });
+      }
 
       // Save order email mapping for both orderId and checkoutRequestId
       saveOrderEmail(orderId, targetEmail);
       saveOrderEmail(checkoutRequestId, targetEmail);
 
+      const checkoutToken = generateCheckoutToken(orderId);
+      setCheckoutCookie(res, orderId, checkoutToken);
+
       return res.json({
         success: true,
         status: "pending",
         orderId: orderId,
+        checkoutToken: checkoutToken,
         paymentId: paymentId,
         checkoutRequestId: checkoutRequestId,
         customerMessage: stkData.CustomerMessage || "STK Push sent to mobile device. Please enter your M-Pesa PIN."
@@ -1706,86 +2064,47 @@ app.post("/api/mpesa/stkpush", async (req, res) => {
     } else {
       console.error("M-Pesa STK Push Rejected by Safaricom:", stkData);
       // Clean up payment and order records on definitive Daraja API rejection
-      await supabaseAdmin.from("payments").delete().eq("id", paymentId);
-      await supabaseAdmin.from("Orders").delete().eq("id", orderId);
+      const { error: pErr } = await supabaseAdmin.from("payments").delete().eq("id", paymentId);
+      const { error: oErr } = await supabaseAdmin.from("Orders").delete().eq("id", orderId);
+      
+      if (pErr || oErr) {
+        console.error("Failed to cleanup records on Daraja rejection:", { pErr, oErr });
+      }
 
       return res.status(400).json({
         success: false,
+        outcome: "definite_failure",
         error: stkData.CustomerMessage || stkData.ResponseDescription || "STK Push request was declined by Safaricom."
       });
     }
   } catch (err: any) {
-    // Requirement 2: Ambiguous / Unknown Network Transport Error
+    // Requirement: Ambiguous / Unknown Network Transport Error
     // Network timeouts or transport errors do NOT prove the STK Push failed on Safaricom's end.
     // Preserve pending Order and Payment records so later Daraja callback can reconcile using CheckoutRequestID.
     console.warn("[M-Pesa STK Push] Ambiguous network/transport error during initiation. Preserving pending Order & Payment for callback reconciliation:", err?.message);
-    return res.status(504).json({
+    return res.status(202).json({
       success: false,
+      uncertainOutcome: true,
+      outcome: "uncertain",
       error: "Payment status is being confirmed. If you already received an M-Pesa prompt, do not retry the payment."
     });
   }
 });
 
-// TEMPORARY: Isolated Administrator/Developer Payment Simulation Endpoint
+// Isolated Administrator/Developer Payment Simulation Endpoint
 // Safely executes the exact downstream post-payment fulfillment architecture without touching real M-Pesa callback.
 app.post("/api/admin/simulate-successful-payment", async (req, res) => {
-  // 0. Secret-safe diagnostic logging (strictly boolean flags; never logs secrets, raw headers, or request bodies)
-  const isSimulationEnabled = process.env.ENABLE_PAYMENT_SIMULATION === 'true';
-  const configuredSimSecret = process.env.SIMULATION_SECRET?.trim();
-  const rawSimHeader = req.headers['x-simulation-secret'];
-  const isHeaderPresent = Boolean(rawSimHeader);
-  const isSecretConfigured = Boolean(configuredSimSecret && configuredSimSecret.length > 0);
-  const trimmedSimHeader = typeof rawSimHeader === 'string' ? rawSimHeader.trim() : '';
-  const isHeaderMatch = Boolean(isSecretConfigured && isHeaderPresent && rawSimHeader === configuredSimSecret);
-  const isHeaderTrimmedMatch = Boolean(
-    isSecretConfigured &&
-    isHeaderPresent &&
-    trimmedSimHeader.length > 0 &&
-    trimmedSimHeader === configuredSimSecret
-  );
-
-  console.log('[SIMULATION-AUTH-DIAGNOSTIC]', {
-    ENABLE_PAYMENT_SIMULATION_is_true: isSimulationEnabled,
-    SIMULATION_SECRET_configured: isSecretConfigured,
-    x_simulation_secret_header_present: isHeaderPresent,
-    supplied_header_matches_configured_secret: isHeaderMatch,
-    supplied_header_trimmed_matches_secret: isHeaderTrimmedMatch
-  });
-
-  // 1. Guard check: Must be explicitly enabled via environment variable
-  if (!isSimulationEnabled) {
+  // 1. Guard check: Must be in simulation mode
+  const paymentMode = getPaymentMode();
+  if (!paymentMode.isSimulation) {
     return res.status(403).json({
       success: false,
-      error: "Payment simulation is disabled. Set ENABLE_PAYMENT_SIMULATION=true to enable."
+      error: "Payment simulation is disabled. Configure PAYMENT_MODE=simulation to enable."
     });
   }
 
   // 2. Authentication check: Require valid Admin JWT OR dedicated SIMULATION_SECRET
-  const authHeader = req.headers.authorization || '';
-  const simulationSecretHeader = req.headers['x-simulation-secret'] || req.body?.simulationSecret;
-
-  let isAuthorized = false;
-  if (authHeader.startsWith("Bearer ")) {
-    try {
-      const token = authHeader.split(" ")[1];
-      jwt.verify(token, JWT_SECRET);
-      isAuthorized = true;
-    } catch {
-      isAuthorized = false;
-    }
-  }
-
-  const candidateSimSecret = typeof simulationSecretHeader === 'string' ? simulationSecretHeader.trim() : '';
-
-  if (
-    !isAuthorized &&
-    isSecretConfigured &&
-    candidateSimSecret.length > 0 &&
-    candidateSimSecret === configuredSimSecret
-  ) {
-    isAuthorized = true;
-  }
-
+  const isAuthorized = isAuthorizedAdminOrSimulationSecret(req);
   if (!isAuthorized) {
     return res.status(401).json({
       success: false,
@@ -1793,8 +2112,25 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
     });
   }
 
-  const { paper_id, paperId, first_name, firstName, studentFirstName, second_name, secondName, studentSecondName, phone, email, studentEmail } = req.body;
+  const { 
+    paper_id, paperId, 
+    order_id, orderId: bodyOrderId,
+    idempotency_key, idempotencyKey: bodyIdempotencyKey,
+    first_name, firstName, studentFirstName, 
+    second_name, secondName, studentSecondName, 
+    phone, email, studentEmail,
+    resendEmail
+  } = req.body || {};
 
+  const rawIdempotencyKey = (
+    idempotency_key ||
+    bodyIdempotencyKey ||
+    req.headers['idempotency-key'] ||
+    req.headers['x-idempotency-key']
+  ) as string | undefined;
+  const effectiveIdempotencyKey = rawIdempotencyKey ? String(rawIdempotencyKey).trim() : '';
+
+  let inputOrderId = (order_id || bodyOrderId || '').trim();
   const targetPaperId = paper_id || paperId;
   const targetFirstName = (first_name || firstName || studentFirstName || 'TestCustomer').trim();
   const targetSecondName = (second_name || secondName || studentSecondName || 'Simulation').trim();
@@ -1802,16 +2138,242 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
   const rawPhone = phone || '0712345678';
   const normalizedPhone = normalizeKenyanPhone(rawPhone) || '254712345678';
 
-  if (!targetPaperId) {
-    return res.status(400).json({ success: false, error: "Paper ID is required for simulation." });
-  }
-
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!targetEmail || !emailRegex.test(targetEmail)) {
-    return res.status(400).json({ success: false, error: "Valid recipient email address is required for simulation." });
-  }
-
   try {
+    // If no explicit order_id was provided, check if this idempotency key was previously processed
+    if (!inputOrderId && effectiveIdempotencyKey) {
+      const cached = simulatedIdempotencyRegistry.get(effectiveIdempotencyKey);
+      if (cached?.orderId) {
+        inputOrderId = cached.orderId;
+        console.log(`[SIMULATION IDEMPOTENCY] Reusing order ${inputOrderId} from in-memory idempotency key: ${effectiveIdempotencyKey}`);
+      } else {
+        const { data: idemPayment } = await supabaseAdmin
+          .from("payments")
+          .select("order_id, mpesa_receipt")
+          .eq("merchant_request_id", `SIM_IDEM_${effectiveIdempotencyKey}`)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (idemPayment?.order_id) {
+          inputOrderId = idemPayment.order_id;
+          simulatedIdempotencyRegistry.set(effectiveIdempotencyKey, {
+            orderId: idemPayment.order_id,
+            mpesaReceipt: idemPayment.mpesa_receipt,
+            createdAt: Date.now()
+          });
+          console.log(`[SIMULATION IDEMPOTENCY] Reusing order ${inputOrderId} from persisted database idempotency key: ${effectiveIdempotencyKey}`);
+        }
+      }
+    }
+
+    // 3. Prevent duplicate paid orders / payment records on retry (Requirement 9)
+    if (inputOrderId) {
+      const { data: existingOrder, error: orderLookupErr } = await supabaseAdmin
+        .from("Orders")
+        .select("*, customers(*)")
+        .eq("id", inputOrderId)
+        .maybeSingle();
+
+      if (orderLookupErr) {
+        return res.status(500).json({ success: false, error: "Failed to query order records." });
+      }
+
+      if (existingOrder) {
+        // Fetch existing payment
+        const { data: existingPayment } = await supabaseAdmin
+          .from("payments")
+          .select("*")
+          .eq("order_id", existingOrder.id)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        // Fetch authoritative paper details
+        let dbPaper: any = null;
+        if (existingOrder.paper_id) {
+          const { data: pData } = await supabaseAdmin
+            .from("Papers")
+            .select("*")
+            .eq("id", existingOrder.paper_id)
+            .maybeSingle();
+          dbPaper = pData;
+        }
+
+        const orderCust = Array.isArray(existingOrder.customers) ? existingOrder.customers[0] : existingOrder.customers;
+        const resolvedEmail = targetEmail || getOrderEmail(existingOrder.id) || orderCust?.phone || '';
+        const paperTitle = dbPaper?.paper_title || 'Purchased Document';
+        const priceNumeric = Number(existingOrder.amount) || Number(dbPaper?.price) || 50;
+
+        // If order was already paid, do not duplicate order or payment!
+        if (existingOrder.status === 'paid') {
+          const simReceipt = existingPayment?.mpesa_receipt || 'SIMULATED';
+          const accessToken = generateAccessToken(existingOrder.id);
+          const openDocumentUrl = getDocumentAccessUrl(req, accessToken);
+
+          let emailStatus = 'cached';
+          let emailError: string | null = null;
+          const cachedEmail = orderEmailStatusMap.get(existingOrder.id);
+          if (cachedEmail) {
+            emailStatus = cachedEmail.status;
+            emailError = cachedEmail.error || null;
+          }
+
+          if (resendEmail && resolvedEmail && resolvedEmail.includes('@')) {
+            console.log(`[SIMULATION RETRY] Resending activation email for paid order ${existingOrder.id} to: ${resolvedEmail}`);
+            const emailResult = await sendActivationEmail({
+              to: resolvedEmail,
+              firstName: targetFirstName || orderCust?.first_name || 'Customer',
+              paperTitle,
+              openDocumentUrl,
+            });
+            emailStatus = emailResult.status;
+            emailError = emailResult.error || null;
+            orderEmailStatusMap.set(existingOrder.id, {
+              status: emailResult.status,
+              sentAt: new Date().toISOString(),
+              error: emailResult.error,
+            });
+          }
+
+          if (effectiveIdempotencyKey) {
+            simulatedIdempotencyRegistry.set(effectiveIdempotencyKey, {
+              orderId: existingOrder.id,
+              paymentId: existingPayment?.id,
+              mpesaReceipt: simReceipt,
+              createdAt: Date.now()
+            });
+          }
+
+          const checkoutToken = generateCheckoutToken(existingOrder.id);
+          setCheckoutCookie(res, existingOrder.id, checkoutToken);
+
+          return res.json({
+            success: true,
+            simulated: true,
+            alreadyPaid: true,
+            orderId: existingOrder.id,
+            paymentId: existingPayment?.id,
+            mpesaReceipt: simReceipt,
+            orderStatus: 'paid',
+            paymentStatus: existingPayment?.status || 'completed',
+            accessToken,
+            openDocumentUrl,
+            checkoutToken,
+            emailSentTo: resolvedEmail,
+            emailStatus,
+            emailError,
+            message: "Order was already marked paid. Reused existing order without creating duplicate records."
+          });
+        }
+
+        // If order exists and is pending, complete that exact order!
+        const timestampPart = Date.now().toString(36).toUpperCase();
+        const simReceipt = `SIM${timestampPart}`;
+        const simCheckoutId = `ws_CO_SIM_${Date.now()}`;
+        const simMerchantId = `SIM_MERCHANT_${Date.now()}`;
+
+        let paymentId = existingPayment?.id;
+        if (paymentId) {
+          await supabaseAdmin
+            .from("payments")
+            .update({
+              status: 'completed',
+              mpesa_receipt: simReceipt,
+              amount: priceNumeric,
+              phone: normalizedPhone,
+              checkout_request_id: simCheckoutId,
+              merchant_request_id: simMerchantId,
+              transaction_date: new Date().toISOString()
+            })
+            .eq("id", paymentId);
+        } else {
+          const { data: newPay } = await supabaseAdmin
+            .from("payments")
+            .insert({
+              order_id: existingOrder.id,
+              phone: normalizedPhone,
+              amount: priceNumeric,
+              status: 'completed',
+              mpesa_receipt: simReceipt,
+              checkout_request_id: simCheckoutId,
+              merchant_request_id: simMerchantId,
+              transaction_date: new Date().toISOString()
+            })
+            .select("id")
+            .single();
+          paymentId = newPay?.id;
+        }
+
+        await supabaseAdmin
+          .from("Orders")
+          .update({ status: 'paid' })
+          .eq("id", existingOrder.id);
+
+        console.log(`[SIMULATION SUCCESS] Existing pending order ${existingOrder.id} transitioned to PAID with receipt ${simReceipt}`);
+
+        generateAndMergeReceipt(existingOrder.id).catch(err => {
+          console.error("[SIMULATION RECEIPT ERROR]", err);
+        });
+
+        const accessToken = generateAccessToken(existingOrder.id);
+        const openDocumentUrl = getDocumentAccessUrl(req, accessToken);
+
+        if (resolvedEmail) {
+          saveOrderEmail(existingOrder.id, resolvedEmail);
+          saveOrderEmail(simCheckoutId, resolvedEmail);
+        }
+
+        let emailStatus = 'pending';
+        let emailError: string | null = null;
+        if (resolvedEmail && resolvedEmail.includes('@')) {
+          try {
+            console.log(`[SIMULATION] Sending document activation email for order ${existingOrder.id} to: ${resolvedEmail}`);
+            const emailResult = await sendActivationEmail({
+              to: resolvedEmail,
+              firstName: targetFirstName || orderCust?.first_name || 'Customer',
+              paperTitle,
+              openDocumentUrl,
+            });
+            emailStatus = emailResult.status;
+            if (emailResult.error) emailError = emailResult.error;
+            orderEmailStatusMap.set(existingOrder.id, {
+              status: emailResult.status,
+              sentAt: new Date().toISOString(),
+              error: emailResult.error,
+            });
+          } catch (mailErr: any) {
+            emailStatus = 'failed';
+            emailError = mailErr?.message || 'Email delivery exception';
+          }
+        }
+
+        return res.json({
+          success: true,
+          simulated: true,
+          orderId: existingOrder.id,
+          paymentId,
+          mpesaReceipt: simReceipt,
+          orderStatus: 'paid',
+          paymentStatus: 'completed',
+          accessToken,
+          openDocumentUrl,
+          emailSentTo: resolvedEmail,
+          emailStatus,
+          emailError
+        });
+      }
+    }
+
+    // 4. Validate input paper & email for new order creation
+    if (!targetPaperId) {
+      return res.status(400).json({ success: false, error: "Paper ID is required for simulation." });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!targetEmail || !emailRegex.test(targetEmail)) {
+      return res.status(400).json({ success: false, error: "Valid recipient email address is required for simulation." });
+    }
+
     // Fetch authoritative paper details
     const { data: dbPaper, error: paperErr } = await supabaseAdmin
       .from("Papers")
@@ -1823,7 +2385,54 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
       return res.status(404).json({ success: false, error: "Paper not found in catalog." });
     }
 
-    const priceNumeric = Number(dbPaper.price) || 50;
+    let purchasedPages: number[] | null = null;
+    let pageQuantity: number | null = null;
+    let unitPrice: number | null = null;
+    let priceNumeric = Number(dbPaper.price) || 50;
+
+    const purchaseType = (req.body.purchase_type || (req.body.selected_pages || req.body.page_quantity ? 'pages' : 'full')).toLowerCase();
+
+    if (purchaseType === 'pages') {
+      const eligiblePages: number[] = Array.isArray(dbPaper.eligible_pages) ? dbPaper.eligible_pages : [];
+      let targetPages: number[] = [];
+
+      if (Array.isArray(req.body.selected_pages) && req.body.selected_pages.length > 0) {
+        targetPages = Array.from(new Set<number>(req.body.selected_pages.map((p: any) => Number(p))))
+          .filter((p: number): p is number => !isNaN(p) && p > 0)
+          .sort((a: number, b: number) => a - b);
+      } else if (req.body.page_quantity) {
+        const qty = parseInt(req.body.page_quantity, 10);
+        if (isNaN(qty) || qty < 6 || qty > eligiblePages.length) {
+          return res.status(400).json({ success: false, error: "Invalid page quantity requested." });
+        }
+        targetPages = eligiblePages.slice(-qty).reverse();
+      }
+
+      if (targetPages.length < 6) {
+        return res.status(400).json({ success: false, error: "Minimum purchase is 6 pages." });
+      }
+
+      const invalidPages = targetPages.filter((p) => !eligiblePages.includes(p));
+      if (invalidPages.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: `Pages [${invalidPages.join(', ')}] are not eligible for purchase.`
+        });
+      }
+
+      const pricingResult = calculateAuthoritativePagesPrice(dbPaper, targetPages);
+      if (!pricingResult.isValid) {
+        return res.status(400).json({
+          success: false,
+          error: pricingResult.validationError || "Invalid page selection or pricing configuration."
+        });
+      }
+
+      purchasedPages = targetPages;
+      pageQuantity = targetPages.length;
+      priceNumeric = pricingResult.totalAmount;
+      unitPrice = Math.round((priceNumeric / pageQuantity) * 100) / 100;
+    }
 
     // Customer record creation or lookup
     let customerId: string | null = null;
@@ -1839,7 +2448,6 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
 
     if (existingCustomer?.id) {
       customerId = existingCustomer.id;
-      // Update existing customer's names to match current simulation request
       const { error: updateCustErr } = await supabaseAdmin
         .from("customers")
         .update({
@@ -1867,14 +2475,18 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
       customerId = newCust.id;
     }
 
-    // Create Order with pending status initially
+    // Create new Order with pending status initially
     const { data: newOrder, error: ordErr } = await supabaseAdmin
       .from("Orders")
       .insert({
         customer_id: customerId,
         paper_id: targetPaperId,
         amount: priceNumeric,
-        status: 'pending'
+        status: 'pending',
+        purchased_pages: purchasedPages,
+        page_quantity: pageQuantity,
+        unit_price: unitPrice,
+        total_amount: priceNumeric
       })
       .select("id")
       .single();
@@ -1891,7 +2503,7 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
     const timestampPart = Date.now().toString(36).toUpperCase();
     const simReceipt = `SIM${timestampPart}`;
     const simCheckoutId = `ws_CO_SIM_${Date.now()}`;
-    const simMerchantId = `SIM_MERCHANT_${Date.now()}`;
+    const simMerchantId = effectiveIdempotencyKey ? `SIM_IDEM_${effectiveIdempotencyKey}` : `SIM_MERCHANT_${Date.now()}`;
 
     // Create payment record
     const { data: newPayment, error: payErr } = await supabaseAdmin
@@ -1971,6 +2583,18 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
       console.error(`[SIMULATION] Email error:`, mailErr);
     }
 
+    if (effectiveIdempotencyKey) {
+      simulatedIdempotencyRegistry.set(effectiveIdempotencyKey, {
+        orderId,
+        paymentId,
+        mpesaReceipt: simReceipt,
+        createdAt: Date.now()
+      });
+    }
+
+    const checkoutToken = generateCheckoutToken(orderId);
+    setCheckoutCookie(res, orderId, checkoutToken);
+
     return res.json({
       success: true,
       simulated: true,
@@ -1979,6 +2603,9 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
       mpesaReceipt: simReceipt,
       orderStatus: 'paid',
       paymentStatus: 'completed',
+      accessToken,
+      openDocumentUrl,
+      checkoutToken,
       emailSentTo: targetEmail,
       emailStatus,
       emailError
@@ -1986,6 +2613,75 @@ app.post("/api/admin/simulate-successful-payment", async (req, res) => {
   } catch (err: any) {
     console.error("[SIMULATION ERROR] Execution failed:", err);
     return res.status(500).json({ success: false, error: err?.message || "Simulation error." });
+  }
+});
+
+// Admin Diagnostic Endpoint: Verifies SMTP credentials and connectivity
+// Does NOT create orders, does NOT create payments, and does NOT expose passwords.
+app.all("/api/admin/test-smtp", async (req, res) => {
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return res.status(405).json({ error: "Method not allowed. Use GET or POST." });
+  }
+
+  // Security Gate: Administrator authentication required
+  const isAuthorized = isAuthorizedAdminOrSimulationSecret(req);
+  if (!isAuthorized) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized: Valid admin token or simulation secret required."
+    });
+  }
+
+  try {
+    const diagnostic = await verifySmtpConnection();
+    const testRecipient = req.body?.testEmail?.trim();
+    let pingResult: any = null;
+
+    if (diagnostic.verified && testRecipient && testRecipient.includes('@')) {
+      const transporter = createSmtpTransporter();
+      if (transporter) {
+        const { smtpUser } = getSmtpConfig();
+        try {
+          console.log(`[SMTP TEST PING] Sending test verification email to: ${testRecipient}`);
+          const info = await transporter.sendMail({
+            from: `"Godrery Publishers Test" <${smtpUser}>`,
+            to: testRecipient,
+            subject: 'Godrery Publishers - SMTP Integration Test Ping',
+            text: 'This is an automated diagnostic test verifying SMTP relay delivery on Godrery Publishers.',
+          });
+          pingResult = {
+            attempted: true,
+            success: true,
+            messageId: info.messageId,
+            response: info.response,
+          };
+          console.log(`[SMTP TEST PING SUCCESS] MessageId: ${info.messageId}`);
+        } catch (pingErr: any) {
+          console.error(`[SMTP TEST PING FAILED]:`, pingErr);
+          pingResult = {
+            attempted: true,
+            success: false,
+            error: pingErr.message,
+            code: pingErr.code,
+          };
+        }
+      }
+    }
+
+    return res.json({
+      success: diagnostic.verified,
+      diagnostic,
+      pingResult,
+      explanation: diagnostic.verified 
+        ? "SMTP server successfully authenticated and accepted test connection. (Note: Actual inbox delivery depends on recipient mailserver filtering, SPF/DKIM, and spam policies)."
+        : `SMTP connection or authentication failed: ${diagnostic.error}`
+    });
+  } catch (err: any) {
+    console.error("[SMTP DIAGNOSTIC EXCEPTION]", err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || "Failed to execute SMTP diagnostic."
+    });
   }
 });
 
@@ -2242,13 +2938,17 @@ app.get("/api/orders/:orderId/status", async (req, res) => {
       .eq("order_id", orderId)
       .maybeSingle();
 
+    // SECURITY: Authorize caller before granting access token.
+    // Unauthenticated persons merely guessing an order ID must NEVER obtain an access token!
+    const isAuthorized = isCheckoutSessionAuthorized(req, order.id);
+
     return res.json({
       success: true,
       orderId: order.id,
       orderStatus: order.status,
       paymentStatus: payment?.status || 'pending',
       isPaid: order.status === 'paid',
-      accessToken: order.status === 'paid' ? generateAccessToken(order.id) : null,
+      accessToken: (order.status === 'paid' && isAuthorized) ? generateAccessToken(order.id) : null,
       mpesaReceipt: order.status === 'paid' ? (payment?.mpesa_receipt || null) : null,
     });
   } catch (err: any) {
@@ -2263,7 +2963,7 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
   try {
     const { data: order, error: orderErr } = await supabaseAdmin
       .from("Orders")
-      .select("id, status, paper_id, customers (second_name)")
+      .select("id, status, paper_id, purchased_pages, customers (second_name)")
       .eq("id", orderId)
       .maybeSingle();
 
@@ -2293,6 +2993,45 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
       return res.status(404).json({ success: false, error: "Paper file not found in repository." });
     }
 
+    // Determine the PDF to serve
+    let pdfBuffer: Buffer;
+    
+    if (order.purchased_pages && order.purchased_pages.length > 0) {
+        // Page-based purchase logic
+        const restrictedPath = `purchased-pages/${orderId}.pdf`;
+        
+        // Check if restricted PDF already exists
+        const { data: existingRestricted } = await supabaseAdmin.storage.from("Papers").list('purchased-pages', { search: `${orderId}.pdf` });
+        
+        if (existingRestricted && existingRestricted.length > 0 && existingRestricted[0].name === `${orderId}.pdf`) {
+            const { data: fileData, error: downloadErr } = await supabaseAdmin.storage.from("Papers").download(restrictedPath);
+            if (downloadErr || !fileData) return res.status(500).json({ success: false, error: "Failed to retrieve restricted document." });
+            pdfBuffer = Buffer.from(await fileData.arrayBuffer());
+        } else {
+            // Download full PDF
+            const { data: fullPdfBlob, error: downloadErr } = await supabaseAdmin.storage.from("Papers").download(paper.file_path);
+            if (downloadErr || !fullPdfBlob) return res.status(500).json({ success: false, error: "Failed to retrieve full document." });
+            
+            const fullPdfBuffer = Buffer.from(await fullPdfBlob.arrayBuffer());
+            const restrictedPdfBytes = await generatePageSpecificPDF(fullPdfBuffer, order.purchased_pages);
+            
+            // Upload restricted PDF
+            await supabaseAdmin.storage.from("Papers").upload(restrictedPath, Buffer.from(restrictedPdfBytes), {
+                contentType: "application/pdf",
+                upsert: true
+            });
+            pdfBuffer = Buffer.from(restrictedPdfBytes);
+        }
+    } else {
+        // Legacy logic: fetch original file
+        const { data: fileData, error: downloadErr } = await supabaseAdmin.storage.from("Papers").download(paper.file_path);
+        if (downloadErr || !fileData) {
+          console.error("Error downloading PDF from Storage:", downloadErr);
+          return res.status(500).json({ success: false, error: "Failed to retrieve the document." });
+        }
+        pdfBuffer = Buffer.from(await fileData.arrayBuffer());
+    }
+
     // Attempt to record the download
     try {
       const { error: insertErr } = await supabaseAdmin
@@ -2309,21 +3048,9 @@ app.get("/api/orders/:orderId/download", async (req, res) => {
     } catch (dlErr) {
       console.warn("Notice: downloads record exception:", dlErr);
     }
-
-    // Download the raw PDF bytes securely on the backend
-    const { data: fileData, error: downloadErr } = await supabaseAdmin
-      .storage
-      .from("Papers")
-      .download(paper.file_path);
-
-    if (downloadErr || !fileData) {
-      console.error("Error downloading PDF from Storage:", downloadErr);
-      return res.status(500).json({ success: false, error: "Failed to retrieve the document." });
-    }
-
-    // Convert Blob/File to Uint8Array and encrypt
-    const arrayBuffer = await fileData.arrayBuffer();
-    const pdfUint8 = new Uint8Array(arrayBuffer);
+    
+    // Convert PDF buffer to Uint8Array and encrypt
+    const pdfUint8 = new Uint8Array(pdfBuffer);
     
     // Encrypt in-memory using the customer's second name as the user password
     let encryptedBytes;
@@ -2360,6 +3087,9 @@ app.get("/api/transactions", requireAdmin, requireRole(["super_admin", "finance_
         Orders (
           id,
           paper_id,
+          purchased_pages,
+          page_quantity,
+          unit_price,
           customers (first_name, second_name, phone)
         )
       `)
@@ -2393,6 +3123,9 @@ app.get("/api/transactions", requireAdmin, requireRole(["super_admin", "finance_
     
     const formatted = payments.map((p: any) => {
       const paper = p.Orders?.paper_id ? paperMap.get(p.Orders.paper_id) : null;
+      const purchasedPages = Array.isArray(p.Orders?.purchased_pages) ? p.Orders.purchased_pages : null;
+      const isPagesPurchase = purchasedPages && purchasedPages.length > 0;
+
       return {
         id: p.id,
         studentFirstName: p.Orders?.customers?.first_name || '',
@@ -2403,7 +3136,11 @@ app.get("/api/transactions", requireAdmin, requireRole(["super_admin", "finance_
         price: `KSh ${p.amount}`,
         mpesaReceipt: p.mpesa_receipt || 'PENDING',
         status: p.status === 'completed' ? 'Completed' : (p.status === 'pending' ? 'Pending' : 'Failed'),
-        timestamp: p.created_at
+        timestamp: p.created_at,
+        purchased_pages: purchasedPages,
+        page_quantity: p.Orders?.page_quantity || (isPagesPurchase ? purchasedPages.length : null),
+        unit_price: p.Orders?.unit_price || null,
+        purchase_type: isPagesPurchase ? 'pages' : 'full',
       };
     });
     return res.json(formatted);
@@ -2465,519 +3202,34 @@ app.get("/api/admin/stats", requireAdmin, async (req, res) => {
 });
 
 
-// --- MANUAL M-PESA ACTIVATION ENDPOINTS ---
-
-// Admin: Get active manual codes
+// --- MANUAL M-PESA ACTIVATION ENDPOINTS (DECOMMISSIONED) ---
+// All manual code creation, submission, and activation have been permanently decommissioned.
+// Verified Daraja callbacks and authorized simulation are the exclusive activation pathways.
 
 app.get("/api/admin/manual-activation/pending", requireAdmin, async (req, res) => {
-  try {
-    const { data: orders, error } = await supabaseAdmin
-      .from('Orders')
-      .select('*, customers(first_name, second_name, phone), payments(id, mpesa_receipt, phone, status, created_at)')
-      .eq('status', 'waiting_for_activation')
-      .order('created_at', { ascending: false });
-    
-    if (error) throw error;
-    if (!orders || orders.length === 0) {
-      return res.json([]);
-    }
-
-    // Filter out orders that do not have an associated payment record
-    const validOrders = orders.filter((o: any) => o.payments && o.payments.length > 0);
-    if (validOrders.length === 0) {
-      return res.json([]);
-    }
-
-    // Fetch related papers safely by paper_id
-    const paperIds = Array.from(new Set(validOrders.map((o: any) => o.paper_id).filter(Boolean)));
-    const paperMap = new Map();
-    if (paperIds.length > 0) {
-      const { data: papers } = await supabaseAdmin
-        .from('Papers')
-        .select('id, paper_title, unit_code')
-        .in('id', paperIds);
-      if (papers) {
-        papers.forEach((p: any) => paperMap.set(p.id, p));
-      }
-    }
-
-    const formatted = validOrders.map((order: any) => {
-      const sortedPayments = Array.isArray(order.payments)
-        ? [...order.payments].sort((a: any, b: any) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
-        : [];
-      return {
-        ...order,
-        payments: sortedPayments,
-        Papers: paperMap.get(order.paper_id) || null
-      };
-    });
-
-    res.json(formatted);
-  } catch (err) {
-    console.error("Admin fetch pending activations error:", err);
-    res.status(500).json({ error: "Failed to fetch pending activations" });
-  }
+  return res.json([]);
 });
 
 app.get("/api/admin/manual-activation", requireAdmin, async (req, res) => {
-  try {
-    const { data, error } = await supabaseAdmin
-      .from('payments')
-      .select('id, mpesa_receipt, amount, created_at, status')
-      .eq('status', 'manual_active')
-      .order('created_at', { ascending: false });
-    
-    if (error) throw error;
-    res.json(data || []);
-  } catch (err) {
-    console.error("Admin fetch manual codes error:", err);
-    res.status(500).json({ error: "Failed to fetch manual codes" });
-  }
+  return res.json([]);
 });
 
-// Admin: Create manual code
 app.post("/api/admin/manual-activation", requireAdmin, async (req, res) => {
-  try {
-    const { mpesaCode, amount } = req.body;
-    if (!mpesaCode || !amount || amount <= 0) {
-      return res.status(400).json({ error: "Valid M-Pesa code and amount are required." });
-    }
-
-    const codeUpper = mpesaCode.toUpperCase().trim();
-
-    // Check if code already exists and is not failed/pending
-    const { data: existing } = await supabaseAdmin
-      .from('payments')
-      .select('id')
-      .eq('mpesa_receipt', codeUpper)
-      .limit(1);
-
-    if (existing && existing.length > 0) {
-      return res.status(400).json({ error: "This M-Pesa code is already recorded in the system." });
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from('payments')
-      .insert({
-        mpesa_receipt: codeUpper,
-        amount: Number(amount),
-        status: 'manual_active',
-        phone: 'MANUAL',
-        order_id: null
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ success: true, data });
-  } catch (err) {
-    console.error("Admin create manual code error:", err);
-    res.status(500).json({ error: "Failed to create manual activation code." });
-  }
+  return res.status(410).json({
+    error: "Manual activation code creation has been decommissioned. All purchases must be completed and verified via M-Pesa."
+  });
 });
-
-// Customer: Consume manual code
 
 app.post("/api/manual-activation/request", async (req, res) => {
-  try {
-    const { mpesaCode, firstName, secondName, email, paperId, orderId: requestedOrderId } = req.body;
-    if (!mpesaCode || !firstName || !secondName || !email || !paperId) {
-      return res.status(400).json({ error: "First name, second name, email address, and M-Pesa transaction code are all required." });
-    }
-
-    const codeUpper = String(mpesaCode).toUpperCase().trim();
-    const targetFirstName = String(firstName).trim();
-    const targetSecondName = String(secondName).trim();
-    const targetEmail = String(email).trim().toLowerCase();
-
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(targetEmail)) {
-      return res.status(400).json({ error: "Please enter a valid email address format (e.g. name@example.com)." });
-    }
-
-    // Validate M-Pesa transaction code
-    if (codeUpper.length < 5) {
-      return res.status(400).json({ error: "Please enter a valid M-Pesa transaction code." });
-    }
-
-    // 1. Fetch paper
-    const { data: paper, error: paperErr } = await supabaseAdmin
-      .from("Papers")
-      .select("id, price, status, paper_title, unit_code")
-      .eq("id", paperId)
-      .maybeSingle();
-
-    if (paperErr || !paper) return res.status(404).json({ error: "Document not found." });
-
-    const paperAmount = Number(paper.price) || 0;
-
-    // 2. Identify candidate customer records (by email or name) to avoid duplicate customer records
-    let customerId: string | null = null;
-    const candidateCustomerIds: string[] = [];
-
-    const { data: custByEmail } = await supabaseAdmin
-      .from("customers")
-      .select("id")
-      .eq("phone", targetEmail);
-
-    if (custByEmail && custByEmail.length > 0) {
-      custByEmail.forEach((c: any) => {
-        if (!candidateCustomerIds.includes(c.id)) candidateCustomerIds.push(c.id);
-      });
-      customerId = custByEmail[0].id;
-    }
-
-    const { data: custByName } = await supabaseAdmin
-      .from("customers")
-      .select("id")
-      .ilike("first_name", targetFirstName)
-      .ilike("second_name", targetSecondName);
-
-    if (custByName && custByName.length > 0) {
-      custByName.forEach((c: any) => {
-        if (!candidateCustomerIds.includes(c.id)) candidateCustomerIds.push(c.id);
-      });
-      if (!customerId) customerId = custByName[0].id;
-    }
-
-    // 3. Locate Existing Order (EDIT / RESUBMISSION detection)
-    let existingOrder: any = null;
-
-    // Check by explicitly provided orderId from the client session
-    if (requestedOrderId && typeof requestedOrderId === "string" && requestedOrderId.trim().length > 0) {
-      const { data: orderById } = await supabaseAdmin
-        .from("Orders")
-        .select("id, customer_id, paper_id, status, amount")
-        .eq("id", requestedOrderId.trim())
-        .maybeSingle();
-
-      if (orderById && orderById.paper_id === paper.id) {
-        existingOrder = orderById;
-      }
-    }
-
-    // If not identified by orderId, search across candidate customers for an existing pending order for this paper
-    if (!existingOrder && candidateCustomerIds.length > 0) {
-      const { data: pendingOrders } = await supabaseAdmin
-        .from("Orders")
-        .select("id, customer_id, paper_id, status, amount")
-        .in("customer_id", candidateCustomerIds)
-        .eq("paper_id", paper.id)
-        .eq("status", "waiting_for_activation")
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (pendingOrders && pendingOrders.length > 0) {
-        existingOrder = pendingOrders[0];
-      }
-    }
-
-    // 4. Resolve & Update Customer record (Preserve existing customer without creating duplicates)
-    if (existingOrder?.customer_id) {
-      customerId = existingOrder.customer_id;
-      await supabaseAdmin.from("customers").update({
-        first_name: targetFirstName,
-        second_name: targetSecondName,
-        phone: targetEmail
-      }).eq("id", customerId);
-    } else if (customerId) {
-      await supabaseAdmin.from("customers").update({
-        first_name: targetFirstName,
-        second_name: targetSecondName,
-        phone: targetEmail
-      }).eq("id", customerId);
-    } else {
-      const { data: newCust, error: custErr } = await supabaseAdmin
-        .from("customers")
-        .insert({
-          first_name: targetFirstName,
-          second_name: targetSecondName,
-          phone: targetEmail
-        })
-        .select("id")
-        .single();
-      if (custErr) throw custErr;
-      customerId = newCust.id;
-      candidateCustomerIds.push(customerId);
-    }
-
-    // 5. Resolve Order ID (Update existing pending order or create new pending order)
-    let orderId: string;
-    if (existingOrder && existingOrder.status === "waiting_for_activation") {
-      orderId = existingOrder.id;
-      await supabaseAdmin.from("Orders").update({
-        customer_id: customerId,
-        paper_id: paper.id,
-        amount: paperAmount,
-        status: "waiting_for_activation"
-      }).eq("id", orderId);
-    } else {
-      const { data: newOrder, error: orderErr } = await supabaseAdmin
-        .from("Orders")
-        .insert({
-          customer_id: customerId,
-          paper_id: paper.id,
-          amount: paperAmount,
-          status: "waiting_for_activation"
-        })
-        .select("id")
-        .single();
-
-      if (orderErr) throw orderErr;
-      orderId = newOrder.id;
-    }
-
-    // 6. Verify that M-Pesa code is not already redeemed on a DIFFERENT order
-    const { data: codeData } = await supabaseAdmin
-      .from("payments")
-      .select("id, status, order_id, mpesa_receipt")
-      .eq("mpesa_receipt", codeUpper)
-      .maybeSingle();
-
-    if (codeData && codeData.order_id && codeData.order_id !== orderId && (codeData.status === 'completed' || codeData.status === 'manual_used')) {
-      return res.status(400).json({ error: "This M-Pesa transaction code has already been redeemed." });
-    }
-
-    // 7. Resolve Payment Record (SINGLE PAYMENT GUARANTEE FOR THIS ORDER)
-    const { data: existingPayments } = await supabaseAdmin
-      .from("payments")
-      .select("id, mpesa_receipt, status, created_at")
-      .eq("order_id", orderId)
-      .order("created_at", { ascending: true });
-
-    if (existingPayments && existingPayments.length > 0) {
-      // Update the primary payment record with the edited M-Pesa code and email
-      const primaryPayment = existingPayments[0];
-      await supabaseAdmin.from("payments").update({
-        mpesa_receipt: codeUpper,
-        amount: paperAmount,
-        phone: targetEmail,
-        status: 'waiting_for_activation',
-        transaction_date: new Date().toISOString()
-      }).eq("id", primaryPayment.id);
-
-      // Clean up any extra duplicate payment records for this same order
-      if (existingPayments.length > 1) {
-        const extraPaymentIds = existingPayments.slice(1).map((p: any) => p.id);
-        await supabaseAdmin.from("payments").delete().in("id", extraPaymentIds);
-      }
-    } else if (codeData && (!codeData.order_id || codeData.order_id === orderId)) {
-      // Re-use unlinked matching code record
-      await supabaseAdmin.from("payments").update({
-        order_id: orderId,
-        mpesa_receipt: codeUpper,
-        amount: paperAmount,
-        phone: targetEmail,
-        status: 'waiting_for_activation',
-        transaction_date: new Date().toISOString()
-      }).eq("id", codeData.id);
-    } else {
-      // Insert single new payment for this order
-      await supabaseAdmin.from("payments").insert({
-        order_id: orderId,
-        mpesa_receipt: codeUpper,
-        amount: paperAmount,
-        phone: targetEmail,
-        status: 'waiting_for_activation',
-        transaction_date: new Date().toISOString()
-      });
-    }
-
-    // 8. Clean up any orphaned empty pending orders for this customer and paper
-    if (candidateCustomerIds.length > 0) {
-      const { data: otherPending } = await supabaseAdmin
-        .from("Orders")
-        .select("id, payments(id)")
-        .in("customer_id", candidateCustomerIds)
-        .eq("paper_id", paper.id)
-        .eq("status", "waiting_for_activation")
-        .neq("id", orderId);
-
-      if (otherPending && otherPending.length > 0) {
-        for (const orphan of otherPending) {
-          if (!orphan.payments || orphan.payments.length === 0) {
-            await supabaseAdmin.from("Orders").delete().eq("id", orphan.id);
-          }
-        }
-      }
-    }
-
-    return res.json({ 
-      success: true, 
-      orderId: orderId,
-      status: "waiting_for_activation",
-      message: "Payment code submitted successfully. Your transaction is awaiting verification. Once your payment is confirmed, a confirmation email will be sent to your email address with your secure Open Document link."
-    });
-
-  } catch (err) {
-    console.error("Manual activation request error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
+  return res.status(410).json({
+    error: "Manual transaction code submission has been decommissioned. Please complete your payment using Safaricom M-Pesa STK push."
+  });
 });
 
 app.post("/api/manual-activation", async (req, res) => {
-  try {
-    const { mpesaCode, firstName, secondName, paperId } = req.body;
-    if (!mpesaCode || !firstName || !secondName || !paperId) {
-      return res.status(400).json({ error: "All fields are required." });
-    }
-
-    const codeUpper = mpesaCode.toUpperCase().trim();
-    const targetFirstName = firstName.trim().toLowerCase();
-    const targetSecondName = secondName.trim().toLowerCase();
-
-    // 1. Fetch paper price
-    const { data: paper, error: paperErr } = await supabaseAdmin
-      .from("Papers")
-      .select("id, price, status")
-      .eq("id", paperId)
-      .maybeSingle();
-
-    if (paperErr || !paper) {
-      return res.status(404).json({ error: "Document not found." });
-    }
-    if (paper.status !== 'available') {
-      return res.status(400).json({ error: "Document is no longer available." });
-    }
-    
-    const documentPrice = Number(paper.price);
-
-    // 2. Fetch code
-    const { data: codeData, error: codeErr } = await supabaseAdmin
-      .from("payments")
-      .select("*")
-      .eq("mpesa_receipt", codeUpper)
-      .maybeSingle();
-
-    if (codeErr || !codeData) {
-      return res.status(400).json({ error: "Invalid M-Pesa transaction code." });
-    }
-
-    if (codeData.status === 'manual_used') {
-      return res.status(400).json({ error: "This M-Pesa transaction code has already been redeemed and permanently consumed for a document purchase. Use 'View Your Document' to access your paper." });
-    }
-
-    if (codeData.status !== 'manual_active') {
-      return res.status(400).json({ error: "Invalid, inactive, or already used M-Pesa code." });
-    }
-
-    if (Number(codeData.amount) < documentPrice) {
-      return res.status(400).json({ error: "The amount paid does not cover this document. Please check that you selected the document you paid for." });
-    }
-
-    // 3. Consume code atomically
-    const { data: consumed, error: consumeErr } = await supabaseAdmin
-      .from("payments")
-      .update({ status: 'manual_used' })
-      .eq("id", codeData.id)
-      .eq("status", "manual_active")
-      .select()
-      .single();
-
-    if (consumeErr || !consumed) {
-      return res.status(400).json({ error: "Code was just used by another request." });
-    }
-
-    // 4. Create or update customer
-    // We will use a synthetic phone number or null to lookup
-    const pseudoPhone = `MANUAL_${targetSecondName}_${targetFirstName}`;
-    let customerId = null;
-
-    const { data: existingCustomer } = await supabaseAdmin
-      .from("customers")
-      .select("id")
-      .eq("first_name", targetFirstName)
-      .eq("second_name", targetSecondName)
-      .limit(1)
-      .maybeSingle();
-      
-    if (existingCustomer?.id) {
-      customerId = existingCustomer.id;
-    } else {
-      const { data: newCust, error: custErr } = await supabaseAdmin
-        .from("customers")
-        .insert({
-          first_name: targetFirstName,
-          second_name: targetSecondName,
-          phone: pseudoPhone
-        })
-        .select("id")
-        .single();
-      if (custErr) {
-         // Revert code consumption if customer creation fails
-         await supabaseAdmin.from("payments").update({ status: 'manual_active' }).eq("id", consumed.id);
-         throw custErr;
-      }
-      customerId = newCust.id;
-    }
-
-    // 5. Create or Update Order (Fix 1: Prevent orphans)
-    let finalOrderId = null;
-    const { data: pendingOrder } = await supabaseAdmin
-      .from("Orders")
-      .select("id")
-      .eq("customer_id", customerId)
-      .eq("paper_id", paper.id)
-      .eq("status", "pending")
-      .limit(1)
-      .maybeSingle();
-
-    if (pendingOrder?.id) {
-      const { data: updatedOrder, error: updateErr } = await supabaseAdmin
-        .from("Orders")
-        .update({ status: 'paid' })
-        .eq("id", pendingOrder.id)
-        .select("id")
-        .single();
-        
-      if (updateErr) {
-         await supabaseAdmin.from("payments").update({ status: 'manual_active' }).eq("id", consumed.id);
-         throw updateErr;
-      }
-      finalOrderId = updatedOrder.id;
-    } else {
-      const { data: newOrder, error: orderErr } = await supabaseAdmin
-        .from("Orders")
-        .insert({
-          paper_id: paper.id,
-          customer_id: customerId,
-          status: 'paid'
-        })
-        .select("id")
-        .single();
-  
-      if (orderErr) {
-         await supabaseAdmin.from("payments").update({ status: 'manual_active' }).eq("id", consumed.id);
-         throw orderErr;
-      }
-      finalOrderId = newOrder.id;
-    }
-
-    // 6. Link Order to Payment
-    await supabaseAdmin
-      .from("payments")
-      .update({ 
-         order_id: finalOrderId,
-        transaction_date: new Date().toISOString()
-      })
-      .eq("id", consumed.id);
-
-    // 7. Proactively generate receipt
-    // We do not fail the request if generation fails.
-    try {
-       await generateAndMergeReceipt(finalOrderId);
-    } catch (e) {
-       console.error("[RECEIPT ERROR] Manual activation generation failed:", e);
-    }
-
-
-    return res.json({ success: true, orderId: finalOrderId, accessToken: generateAccessToken(finalOrderId) });
-
-  } catch (err) {
-    console.error("Manual activation consume error:", err);
-    res.status(500).json({ error: "Internal server error during manual activation." });
-  }
+  return res.status(410).json({
+    error: "Manual activation has been decommissioned. All purchases must be completed and verified via Safaricom M-Pesa."
+  });
 });
 // --- END MANUAL M-PESA ACTIVATION ENDPOINTS ---
 
@@ -2999,7 +3251,7 @@ app.post("/api/document/find", async (req, res) => {
       .from("payments")
       .select("id, mpesa_receipt, status, order_id")
       .eq("mpesa_receipt", codeUpper)
-      .eq("status", "manual_used")
+      .in("status", ["completed", "manual_used"])
       .maybeSingle();
 
     if (paymentErr || !payment || !payment.order_id) {
@@ -3358,22 +3610,54 @@ app.get("/api/document/stream/:token", async (req, res) => {
         return res.status(403).send("This document is already registered to another device.");
     }
     
-    const { data: order } = await supabaseAdmin.from('Orders').select('paper_id, status').eq('id', orderId).maybeSingle();
+    const { data: order } = await supabaseAdmin.from('Orders').select('paper_id, status, purchased_pages').eq('id', orderId).maybeSingle();
     if (!order || order.status !== 'paid') return res.status(403).send("Access denied. Order is not active or awaiting payment confirmation.");
     
     const { data: paper } = await supabaseAdmin.from('Papers').select('file_path, unit_code').eq('id', order.paper_id).maybeSingle();
     if (!paper || !paper.file_path) return res.status(404).send("File not found (may have been deleted)");
     
-    // Attempt to serve merged document first
-    let downloadPath = paper.file_path;
-    const mergedPath = `merged/${orderId}.pdf`;
-    const { data: existingMerged } = await supabaseAdmin.storage.from("Papers").list('merged', { search: `${orderId}.pdf` });
-    if (existingMerged && existingMerged.length > 0 && existingMerged[0].name === `${orderId}.pdf`) {
-        downloadPath = mergedPath;
-        console.log(`[ACCESS LOG] Serving merged document for order ${orderId}`);
+    // Page-based purchase logic
+    let downloadPath: string | null = null;
+    if (order.purchased_pages && order.purchased_pages.length > 0) {
+        const restrictedPath = `purchased-pages/${orderId}.pdf`;
+        
+        // Check if restricted PDF already exists
+        const { data: existingRestricted } = await supabaseAdmin.storage.from("Papers").list('purchased-pages', { search: `${orderId}.pdf` });
+        
+        if (existingRestricted && existingRestricted.length > 0 && existingRestricted[0].name === `${orderId}.pdf`) {
+            downloadPath = restrictedPath;
+            console.log(`[ACCESS LOG] Serving restricted document for order ${orderId}`);
+        } else {
+            console.log(`[ACCESS LOG] Generating restricted document for order ${orderId}`);
+            // Download full PDF
+            const { data: fullPdfBlob, error: downloadErr } = await supabaseAdmin.storage.from("Papers").download(paper.file_path);
+            if (downloadErr || !fullPdfBlob) return res.status(500).send("Storage error");
+            
+            const fullPdfBuffer = Buffer.from(await fullPdfBlob.arrayBuffer());
+            const restrictedPdfBytes = await generatePageSpecificPDF(fullPdfBuffer, order.purchased_pages);
+            
+            // Upload restricted PDF
+            await supabaseAdmin.storage.from("Papers").upload(restrictedPath, Buffer.from(restrictedPdfBytes), {
+                contentType: "application/pdf",
+                upsert: true
+            });
+            downloadPath = restrictedPath;
+        }
     } else {
-        console.log(`[ACCESS LOG] Serving original document for order ${orderId} (merged not found)`);
+        // Legacy logic
+        downloadPath = paper.file_path; // Default to original file
+        const mergedPath = `merged/${orderId}.pdf`;
+        const { data: existingMerged } = await supabaseAdmin.storage.from("Papers").list('merged', { search: `${orderId}.pdf` });
+        if (existingMerged && existingMerged.length > 0 && existingMerged[0].name === `${orderId}.pdf`) {
+            downloadPath = mergedPath;
+            console.log(`[ACCESS LOG] Serving merged document for order ${orderId}`);
+        } else {
+            console.log(`[ACCESS LOG] Serving original document for order ${orderId} (merged not found)`);
+        }
     }
+
+    if (!downloadPath) return res.status(500).send("File not found");
+
 
     const { data: fileData, error: downloadErr } = await supabaseAdmin.storage.from("Papers").download(downloadPath);
     if (downloadErr || !fileData) {
@@ -3401,121 +3685,20 @@ app.get("/api/document/stream/:token", async (req, res) => {
 
 
 
+// Admin: Manual activation bypass (PERMANENTLY DECOMMISSIONED)
+// Orders are activated exclusively through verified M-Pesa callbacks or authorized test simulation.
 app.post("/api/admin/orders/:id/activate", requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // 1. Find Order with Customer details
-    const { data: order, error: orderErr } = await supabaseAdmin
-      .from("Orders")
-      .select("*, customers(first_name, second_name, phone)")
-      .eq("id", id)
-      .single();
-
-    if (orderErr || !order) return res.status(404).json({ error: "Order not found" });
-
-    // Fetch Paper details safely
-    let paperObj: { paper_title?: string; unit_code?: string } | null = null;
-    if (order.paper_id) {
-      const { data: paper } = await supabaseAdmin
-        .from("Papers")
-        .select("paper_title, unit_code")
-        .eq("id", order.paper_id)
-        .maybeSingle();
-      paperObj = paper;
-    }
-
-    // 2. Find Payment
-    const { data: payments } = await supabaseAdmin
-      .from("payments")
-      .select("*")
-      .eq("order_id", id)
-      .order("created_at", { ascending: false });
-
-    const payment = payments && payments.length > 0 ? payments[0] : null;
-
-    const isAlreadyPaid = order.status === 'paid';
-
-    // 3. Mark as Paid (Idempotent)
-    if (!isAlreadyPaid) {
-      await supabaseAdmin.from("Orders").update({ status: 'paid' }).eq("id", id);
-    }
-    if (payment && payment.status !== 'completed' && payment.status !== 'manual_used') {
-      await supabaseAdmin.from("payments").update({ status: 'completed' }).eq("order_id", id);
-    }
-
-    // 4. Trigger Receipt Generation (Idempotent - checks if merged/{orderId}.pdf already exists)
-    const receiptSuccess = await generateAndMergeReceipt(id);
-
-    // 5. Generate Secure Open Document URL for this exact order
-    const token = generateAccessToken(id);
-    const openDocumentUrl = getDocumentAccessUrl(req, token);
-
-    // 6. Check Document Access Status (Devices registered in downloads)
-    const { data: devices } = await supabaseAdmin.from("downloads").select("id").eq("order_id", id);
-    const deviceCount = devices ? devices.length : 0;
-
-    // 7. Student details
-    const studentEmail = order.customers?.phone || payment?.phone || '';
-    const paperTitle = paperObj?.paper_title || 'Purchased Document';
-    const unitCode = paperObj?.unit_code || '';
-
-    // 8. Handle Automatic Email Sending
-    // If order was ALREADY paid on previous activation, do NOT silently re-send email (use explicit RESEND EMAIL instead)
-    let emailStatus: 'EMAIL SENT' | 'EMAIL FAILED' | 'EMAIL NOT CONFIGURED' = 'EMAIL NOT CONFIGURED';
-    let emailError: string | undefined;
-
-    if (isAlreadyPaid) {
-      const cached = orderEmailStatusMap.get(id);
-      emailStatus = cached ? cached.status : 'EMAIL SENT';
-      emailError = cached?.error;
-    } else {
-      // First-time activation: trigger automatic email
-      const emailResult = await sendActivationEmail({
-        to: studentEmail,
-        firstName: order.customers?.first_name || '',
-        paperTitle,
-        openDocumentUrl,
-      });
-      emailStatus = emailResult.status;
-      emailError = emailResult.error;
-
-      orderEmailStatusMap.set(id, {
-        status: emailStatus,
-        sentAt: new Date().toISOString(),
-        error: emailError,
-      });
-    }
-
-    const activationResult = {
-      studentFirstName: order.customers?.first_name || '',
-      studentSecondName: order.customers?.second_name || '',
-      studentEmail: studentEmail,
-      paperTitle: paperTitle,
-      unitCode: unitCode,
-      amount: order.amount,
-      mpesaReceipt: payment?.mpesa_receipt || '',
-      orderId: id,
-      activationTimestamp: new Date().toISOString(),
-      openDocumentUrl: openDocumentUrl,
-      documentAccessStatus: `${deviceCount} / 3`,
-      receiptGenerationStatus: receiptSuccess ? 'GENERATED' : 'FAILED',
-      emailStatus: emailStatus,
-      emailError: emailError,
-      paymentStatus: 'CONFIRMED',
-      alreadyActivated: isAlreadyPaid,
-    };
-
-    return res.json({ success: true, result: activationResult });
-
-  } catch (err) {
-    console.error("Admin activation error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
+  return res.status(403).json({
+    error: "Manual payment activation is permanently decommissioned. Orders are activated exclusively via verified Daraja callbacks or authorized test simulation."
+  });
 });
 
 // Admin: Resend Activation Email (Idempotent - does not duplicate orders, receipts, payments, or device registrations)
-app.post("/api/admin/orders/:id/resend-email", requireAdmin, async (req, res) => {
+app.post("/api/admin/orders/:id/resend-email", async (req, res) => {
+  if (!isAuthorizedAdminOrSimulationSecret(req)) {
+    return res.status(401).json({ error: "Unauthorized: Administrator authentication or simulation secret required." });
+  }
+
   try {
     const { id } = req.params;
 
@@ -3551,9 +3734,9 @@ app.post("/api/admin/orders/:id/resend-email", requireAdmin, async (req, res) =>
       .limit(1)
       .maybeSingle();
 
-    const studentEmail = order.customers?.phone || payment?.phone || '';
+    const studentEmail = (req.body?.email || getOrderEmail(id) || order.customers?.phone || payment?.phone || '').trim();
     if (!studentEmail || !studentEmail.includes('@')) {
-      return res.status(400).json({ error: "No valid email address found for this order." });
+      return res.status(400).json({ error: "No valid email address found for this order. Please provide email in request body." });
     }
 
     // 3. Prepare exact Open Document URL for this purchase
@@ -3598,71 +3781,13 @@ app.post("/api/admin/orders/:id/generate-receipt", requireAdmin, async (req, res
     }
 });
 
-// Admin: Correct / Update Submitted M-Pesa Code in-place (No duplicate payment/order)
+// Admin: Manual code editing and rejection (DECOMMISSIONED)
 app.patch("/api/admin/orders/:id/code", requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { mpesaCode } = req.body;
-    if (!mpesaCode || typeof mpesaCode !== 'string') {
-      return res.status(400).json({ error: "A valid M-Pesa code is required." });
-    }
-    const cleanCode = mpesaCode.trim().toUpperCase();
-
-    // Find existing payment for this order
-    const { data: payments, error: findErr } = await supabaseAdmin
-      .from("payments")
-      .select("id, mpesa_receipt")
-      .eq("order_id", id)
-      .order("created_at", { ascending: false });
-
-    if (findErr) throw findErr;
-
-    if (payments && payments.length > 0) {
-      const paymentId = payments[0].id;
-      const { error: updateErr } = await supabaseAdmin
-        .from("payments")
-        .update({ mpesa_receipt: cleanCode })
-        .eq("id", paymentId);
-      if (updateErr) throw updateErr;
-    } else {
-      const { error: insertErr } = await supabaseAdmin
-        .from("payments")
-        .insert({
-          order_id: id,
-          mpesa_receipt: cleanCode,
-          status: 'pending',
-          phone: 'MANUAL',
-        });
-      if (insertErr) throw insertErr;
-    }
-
-    return res.json({ success: true, mpesaCode: cleanCode });
-  } catch (err: any) {
-    console.error("Update order M-Pesa code error:", err);
-    return res.status(500).json({ error: "Failed to update M-Pesa code." });
-  }
+  return res.status(410).json({ error: "Manual M-Pesa code editing has been decommissioned." });
 });
 
-// Admin: Reject / Cancel Invalid Pending Activation Request
 app.post("/api/admin/orders/:id/reject", requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { error: orderErr } = await supabaseAdmin
-      .from("Orders")
-      .update({ status: 'rejected' })
-      .eq("id", id);
-    if (orderErr) throw orderErr;
-
-    await supabaseAdmin
-      .from("payments")
-      .update({ status: 'rejected' })
-      .eq("order_id", id);
-
-    return res.json({ success: true, message: "Order rejected." });
-  } catch (err: any) {
-    console.error("Reject order error:", err);
-    return res.status(500).json({ error: "Failed to reject order." });
-  }
+  return res.status(410).json({ error: "Manual order rejection has been decommissioned." });
 });
 
 // Admin: Complete Document Access Directory with real device tracking
@@ -3838,9 +3963,12 @@ app.get("/api/admin/system/status", requireAdmin, async (req, res) => {
           accessibleFilesSample: storageCount,
         },
         mpesa: {
-          name: "M-Pesa Daraja STK Gateway",
-          status: mpesaReady ? "configured" : "pending_configuration",
+          name: "M-Pesa Gateway",
+          mode: getPaymentMode().mode,
+          status: getPaymentMode().isSimulation ? "simulation_active" : (mpesaReady ? "configured" : "pending_configuration"),
           details: {
+            activeMode: getPaymentMode().mode,
+            simulationEnabled: getPaymentMode().isSimulation,
             consumerKeyConfigured: mpesaKeySet,
             consumerSecretConfigured: mpesaSecretSet,
             passkeyConfigured: mpesaPasskeySet,
